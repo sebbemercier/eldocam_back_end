@@ -1,703 +1,525 @@
 package main
 
 import (
-	"encoding/json"
-	"fmt"
-	"html"
-	"io"
-	"log"
-	"net/http"
-	"os"
-	"regexp"
-	"strings"
-	"sync"
-	"time"
+    "encoding/json"
+    "fmt"
+    "html"
+    "io"
+    "log"
+    "net/http"
+    "os"
+    "regexp"
+    "strings"
+    "sync"
+    "time"
 
-	"github.com/joho/godotenv"
-	"github.com/mailjet/mailjet-apiv3-go/v4"
-	"github.com/rs/cors"
+    "github.com/joho/godotenv"
+    "github.com/mailjet/mailjet-apiv3-go/v4"
+    "github.com/rs/cors"
 )
 
-// --- Rate Limiting (protection anti-spam) ---
-var (
-	rateLimitMutex sync.Mutex
-	rateLimits     = make(map[string][]time.Time)
-	urlRegex       = regexp.MustCompile(`https?://[\w\.-]+(?:\.[\w\.-]+)+[\w\-\._~:/?#[\]@!\$&'\(\)\*\+,;=.]+`)
-)
+// Configuration globale
+type Config struct {
+    MailjetAPIKey    string
+    MailjetSecretKey string
+    SenderEmail      string
+    SenderName       string
+    AdminTo          string
+    TurnstileSecret  string
+}
 
-// Structure du formulaire avec validation
+var config Config
+
+// Structure du formulaire de contact
 type ContactForm struct {
-	Name     string `json:"name" validate:"required,min=2,max=80"`
-	Email    string `json:"email" validate:"required,email"`
-	Tel      string `json:"tel" validate:"max=40"`
-	Language string `json:"language"`
-	Message  string `json:"message" validate:"required,min=3,max=5000"`
+    Name     string `json:"name"`
+    Email    string `json:"email"`
+    Tel      string `json:"tel"`
+    Message  string `json:"message"`
+    Language string `json:"language"`
 }
 
-// --- Health Check Handler (pour Kubernetes) ---
-func healthHandler(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusOK)
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"status": "healthy",
-		"time":   time.Now().Format(time.RFC3339),
-	})
+// Rate limiting simple (en mémoire)
+type RateLimiter struct {
+    mu      sync.Mutex
+    clients map[string][]time.Time
 }
 
-// --- Root Handler (documentation) ---
-func rootHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"service": "Eldocam Backend API",
-		"version": "1.0.0",
-		"status":  "operational",
-		"endpoints": map[string]string{
-			"health":  "GET /health",
-			"contact": "POST /api/contact",
-		},
-	})
+var limiter = &RateLimiter{
+    clients: make(map[string][]time.Time),
 }
 
-// --- Fonction de rate limiting (max 3 requêtes par IP toutes les 10 min) ---
-func isRateLimited(ip string) bool {
-	rateLimitMutex.Lock()
-	defer rateLimitMutex.Unlock()
+const (
+    maxRequests = 3
+    timeWindow  = 10 * time.Minute
+)
 
-	now := time.Now()
-	windowStart := now.Add(-10 * time.Minute)
+// Fonction pour parser les deux formats (JSON et form-urlencoded)
+func parseContactForm(r *http.Request) (*ContactForm, error) {
+    var form ContactForm
 
-	// Nettoyer les anciennes entrées
-	var validTimes []time.Time
-	for _, t := range rateLimits[ip] {
-		if t.After(windowStart) {
-			validTimes = append(validTimes, t)
-		}
-	}
-	rateLimits[ip] = validTimes
+    contentType := r.Header.Get("Content-Type")
 
-	// Vérifier la limite
-	if len(rateLimits[ip]) >= 3 {
-		log.Printf("⚠️ Rate limit dépassé pour %s (%d requêtes)", ip, len(rateLimits[ip]))
-		return true
-	}
+    if strings.Contains(contentType, "application/json") {
+        // Format JSON
+        if err := json.NewDecoder(r.Body).Decode(&form); err != nil {
+            return nil, fmt.Errorf("format JSON invalide: %w", err)
+        }
+    } else if strings.Contains(contentType, "application/x-www-form-urlencoded") || r.Method == "POST" {
+        // Format formulaire classique
+        if err := r.ParseForm(); err != nil {
+            return nil, fmt.Errorf("erreur parsing formulaire: %w", err)
+        }
 
-	// Ajouter la nouvelle requête
-	rateLimits[ip] = append(rateLimits[ip], now)
-	return false
+        form = ContactForm{
+            Name:     r.FormValue("name"),
+            Email:    r.FormValue("email"),
+            Tel:      r.FormValue("tel"),
+            Message:  r.FormValue("message"),
+            Language: r.FormValue("language"),
+        }
+    } else {
+        return nil, fmt.Errorf("content-type non supporté: %s", contentType)
+    }
+
+    return &form, nil
 }
 
-// --- Détection de spam basique ---
+// Fonction de rate limiting
+func isRateLimited(clientIP string) bool {
+    limiter.mu.Lock()
+    defer limiter.mu.Unlock()
+
+    now := time.Now()
+    cutoff := now.Add(-timeWindow)
+
+    // Nettoyer les anciennes entrées
+    if times, exists := limiter.clients[clientIP]; exists {
+        var validTimes []time.Time
+        for _, t := range times {
+            if t.After(cutoff) {
+                validTimes = append(validTimes, t)
+            }
+        }
+        limiter.clients[clientIP] = validTimes
+
+        if len(validTimes) >= maxRequests {
+            return true
+        }
+    }
+
+    // Ajouter la nouvelle requête
+    limiter.clients[clientIP] = append(limiter.clients[clientIP], now)
+    return false
+}
+
+// Vérification Cloudflare Turnstile
+func verifyTurnstile(token, clientIP string) bool {
+    if config.TurnstileSecret == "" {
+        log.Println("⚠️ TURNSTILE_SECRET non configuré, validation ignorée")
+        return true
+    }
+
+    data := fmt.Sprintf(`{"secret":"%s","response":"%s","remoteip":"%s"}`,
+        config.TurnstileSecret, token, clientIP)
+
+    resp, err := http.Post(
+        "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+        "application/json",
+        strings.NewReader(data),
+    )
+    if err != nil {
+        log.Printf("❌ Erreur vérification Turnstile: %v", err)
+        return false
+    }
+    defer resp.Body.Close()
+
+    body, _ := io.ReadAll(resp.Body)
+    var result map[string]interface{}
+    json.Unmarshal(body, &result)
+
+    success, _ := result["success"].(bool)
+    return success
+}
+
+// Détection basique de spam
 func containsSpam(message string) bool {
-	lowerMsg := strings.ToLower(message)
+    spamPatterns := []string{
+        `(?i)viagra`,
+        `(?i)casino`,
+        `(?i)lottery`,
+        `(?i)prince`,
+        `(?i)inheritance`,
+        `(?i)click here`,
+        `(?i)buy now`,
+        `http[s]?://[^\s]{50,}`, // URLs très longues
+    }
 
-	// Détection d'URLs (potentiellement du spam)
-	if urlRegex.MatchString(message) {
-		log.Println("⚠️ URL détectée dans le message")
-		return true
-	}
-
-	// Mots-clés spam courants
-	spamKeywords := []string{
-		"viagra", "casino", "lottery", "prize", "click here",
-		"buy now", "limited offer", "crypto", "investment",
-		"bitcoin", "free money", "earn money", "work from home",
-	}
-
-	for _, keyword := range spamKeywords {
-		if strings.Contains(lowerMsg, keyword) {
-			log.Printf("⚠️ Mot-clé spam détecté: %s", keyword)
-			return true
-		}
-	}
-
-	return false
+    for _, pattern := range spamPatterns {
+        matched, _ := regexp.MatchString(pattern, message)
+        if matched {
+            return true
+        }
+    }
+    return false
 }
 
-// --- Validation email robuste ---
-func isValidEmail(email string) bool {
-	// Regex email standard RFC 5322
-	emailRegex := regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`)
-
-	if !emailRegex.MatchString(email) {
-		return false
-	}
-
-	// Bloquer les domaines jetables courants
-	disposableDomains := []string{
-		"tempmail.com", "guerrillamail.com", "10minutemail.com",
-		"mailinator.com", "throwaway.email", "yopmail.com",
-	}
-
-	emailLower := strings.ToLower(email)
-	for _, domain := range disposableDomains {
-		if strings.HasSuffix(emailLower, "@"+domain) {
-			log.Printf("⚠️ Email jetable détecté: %s", email)
-			return false
-		}
-	}
-
-	return true
+// Messages traduits
+func getTranslatedMessage(language string) (subject string, greeting string, body string, closing string) {
+    switch language {
+    case "en":
+        return "Thank you for contacting Eldocam",
+            "Hello",
+            "Thank you for contacting us. We have received your message and will get back to you as soon as possible.",
+            "Best regards,\nThe Eldocam Team"
+    case "nl":
+        return "Bedankt voor het contacteren van Eldocam",
+            "Hallo",
+            "Bedankt voor uw bericht. We hebben uw bericht ontvangen en zullen zo snel mogelijk contact met u opnemen.",
+            "Met vriendelijke groet,\nHet Eldocam Team"
+    default: // "fr"
+        return "Merci d'avoir contacté Eldocam",
+            "Bonjour",
+            "Merci de nous avoir contactés. Nous avons bien reçu votre message et nous vous répondrons dans les plus brefs délais.",
+            "Cordialement,\nL'équipe Eldocam"
+    }
 }
 
-// --- Vérification Cloudflare Turnstile ---
-func verifyTurnstile(token, ip string) bool {
-	secret := os.Getenv("TURNSTILE_SECRET")
-	if secret == "" {
-		log.Println("❌ TURNSTILE_SECRET non configuré")
-		return false
-	}
+// Envoi de l'email via Mailjet
+func sendEmail(form *ContactForm) (string, error) {
+    mailjetClient := mailjet.NewMailjetClient(config.MailjetAPIKey, config.MailjetSecretKey)
 
-	payload := fmt.Sprintf(`{"secret":"%s","response":"%s","remoteip":"%s"}`, secret, token, ip)
-	resp, err := http.Post(
-		"https://challenges.cloudflare.com/turnstile/v0/siteverify",
-		"application/json",
-		strings.NewReader(payload),
-	)
-	if err != nil {
-		log.Println("❌ Erreur requête Turnstile:", err)
-		return false
-	}
-	defer resp.Body.Close()
+    // Échapper les données HTML
+    safeName := html.EscapeString(form.Name)
+    safeEmail := html.EscapeString(form.Email)
+    safeTel := html.EscapeString(form.Tel)
+    safeMessage := html.EscapeString(form.Message)
 
-	body, _ := io.ReadAll(resp.Body)
-	var result map[string]interface{}
-	if err := json.Unmarshal(body, &result); err != nil {
-		log.Println("❌ Erreur parsing Turnstile:", err)
-		return false
-	}
+    // Email pour l'admin
+    adminHTMLContent := fmt.Sprintf(`
+        <h2>Nouveau message de contact - Eldocam</h2>
+        <p><strong>Nom :</strong> %s</p>
+        <p><strong>Email :</strong> %s</p>
+        <p><strong>Téléphone :</strong> %s</p>
+        <p><strong>Message :</strong></p>
+        <p>%s</p>
+    `, safeName, safeEmail, safeTel, strings.ReplaceAll(safeMessage, "\n", "<br>"))
 
-	success, ok := result["success"].(bool)
-	if !ok || !success {
-		log.Println("❌ Vérification Turnstile échouée")
-		return false
-	}
+    adminTextContent := fmt.Sprintf(
+        "Nouveau message de contact\n\nNom: %s\nEmail: %s\nTéléphone: %s\n\nMessage:\n%s",
+        safeName, safeEmail, safeTel, safeMessage,
+    )
 
-	log.Println("✅ Vérification Turnstile réussie")
-	return true
+    messagesInfo := []mailjet.InfoMessagesV31{
+        {
+            From: &mailjet.RecipientV31{
+                Email: config.SenderEmail,
+                Name:  config.SenderName,
+            },
+            To: &mailjet.RecipientsV31{
+                mailjet.RecipientV31{
+                    Email: config.AdminTo,
+                },
+            },
+            Subject:  "Nouveau message de contact - Eldocam",
+            TextPart: adminTextContent,
+            HTMLPart: adminHTMLContent,
+        },
+    }
+
+    // Auto-reply au client
+    subject, greeting, body, closing := getTranslatedMessage(form.Language)
+
+    clientHTMLContent := fmt.Sprintf(`
+        <h2>%s</h2>
+        <p>%s %s,</p>
+        <p>%s</p>
+        <hr>
+        <p><strong>Votre message :</strong></p>
+        <p>%s</p>
+        <hr>
+        <p>%s</p>
+    `, subject, greeting, safeName, body, strings.ReplaceAll(safeMessage, "\n", "<br>"), closing)
+
+    clientTextContent := fmt.Sprintf(
+        "%s %s,\n\n%s\n\n---\nVotre message:\n%s\n\n---\n%s",
+        greeting, safeName, body, safeMessage, closing,
+    )
+
+    messagesInfo = append(messagesInfo, mailjet.InfoMessagesV31{
+        From: &mailjet.RecipientV31{
+            Email: config.SenderEmail,
+            Name:  config.SenderName,
+        },
+        To: &mailjet.RecipientsV31{
+            mailjet.RecipientV31{
+                Email: form.Email,
+                Name:  form.Name,
+            },
+        },
+        Subject:  subject,
+        TextPart: clientTextContent,
+        HTMLPart: clientHTMLContent,
+    })
+
+    messages := mailjet.MessagesV31{Info: messagesInfo}
+    res, err := mailjetClient.SendMailV31(&messages)
+    if err != nil {
+        return "", fmt.Errorf("erreur Mailjet: %w", err)
+    }
+
+    if res.ResultsV31[0].Status != "success" {
+        return "", fmt.Errorf("échec envoi email: %s", res.ResultsV31[0].Status)
+    }
+
+    log.Printf("✅ Email envoyé avec succès à %s et %s", config.AdminTo, form.Email)
+    return "Message envoyé avec succès !", nil
 }
 
-// --- Handler principal du formulaire de contact ---
+// Handler pour le formulaire de contact
 func contactHandler(w http.ResponseWriter, r *http.Request) {
-	// Accepter uniquement POST
-	if r.Method != http.MethodPost {
-		http.Error(w, `{"error":"Méthode non autorisée"}`, http.StatusMethodNotAllowed)
-		return
-	}
+    w.Header().Set("Content-Type", "application/json")
 
-	// Rate limiting par IP
-	ip := r.RemoteAddr
-	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
-		ip = strings.Split(forwarded, ",")[0]
-	}
+    // ✅ Accepte POST et OPTIONS
+    if r.Method == "OPTIONS" {
+        w.WriteHeader(http.StatusOK)
+        return
+    }
 
-	if isRateLimited(ip) {
-		log.Printf("🚫 Rate limit pour IP: %s", ip)
-		http.Error(w, `{"error":"Trop de requêtes. Réessayez plus tard."}`, http.StatusTooManyRequests)
-		return
-	}
+    if r.Method != "POST" {
+        w.WriteHeader(http.StatusMethodNotAllowed)
+        json.NewEncoder(w).Encode(map[string]string{
+            "error": "Méthode non autorisée. Utilisez POST.",
+        })
+        return
+    }
 
-	// Parser le JSON
-	var form ContactForm
-	if err := json.NewDecoder(r.Body).Decode(&form); err != nil {
-		log.Println("❌ Erreur parsing JSON:", err)
-		http.Error(w, `{"error":"Format JSON invalide"}`, http.StatusBadRequest)
-		return
-	}
+    // Rate limiting
+    clientIP := r.RemoteAddr
+    if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+        clientIP = strings.Split(forwarded, ",")[0]
+    }
 
-	// Validation des champs
-	if len(form.Name) < 2 || len(form.Name) > 80 {
-		http.Error(w, `{"error":"Le nom doit contenir entre 2 et 80 caractères"}`, http.StatusBadRequest)
-		return
-	}
+    if isRateLimited(clientIP) {
+        log.Printf("⚠️ Rate limit dépassé pour %s", clientIP)
+        w.WriteHeader(http.StatusTooManyRequests)
+        json.NewEncoder(w).Encode(map[string]string{
+            "error": "Trop de requêtes. Veuillez réessayer dans 10 minutes.",
+        })
+        return
+    }
 
-	if !isValidEmail(form.Email) {
-		http.Error(w, `{"error":"Adresse email invalide"}`, http.StatusBadRequest)
-		return
-	}
+    // ✅ Parse le formulaire (JSON ou form-urlencoded)
+    form, err := parseContactForm(r)
+    if err != nil {
+        log.Printf("❌ Erreur parsing: %v", err)
+        w.WriteHeader(http.StatusBadRequest)
+        json.NewEncoder(w).Encode(map[string]string{
+            "error": err.Error(),
+        })
+        return
+    }
 
-	if len(form.Message) < 3 || len(form.Message) > 5000 {
-		http.Error(w, `{"error":"Le message doit contenir entre 3 et 5000 caractères"}`, http.StatusBadRequest)
-		return
-	}
+    // Validation basique
+    if form.Name == "" || form.Email == "" || form.Message == "" {
+        w.WriteHeader(http.StatusBadRequest)
+        json.NewEncoder(w).Encode(map[string]string{
+            "error": "Veuillez remplir tous les champs obligatoires",
+        })
+        return
+    }
 
-	// Détection de spam
-	if containsSpam(form.Message) {
-		log.Println("🚫 Message suspect détecté")
-		http.Error(w, `{"error":"Message suspect détecté"}`, http.StatusBadRequest)
-		return
-	}
+    // Validation email
+    emailRegex := regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`)
+    if !emailRegex.MatchString(form.Email) {
+        w.WriteHeader(http.StatusBadRequest)
+        json.NewEncoder(w).Encode(map[string]string{
+            "error": "Format d'email invalide",
+        })
+        return
+    }
 
-	// Vérification Cloudflare Turnstile
-	turnstileToken := r.Header.Get("cf-turnstile-response")
-	if turnstileToken == "" {
-		// Essayer de récupérer depuis le body JSON
-		var tokenPayload struct {
-			TurnstileToken string `json:"cf-turnstile-response"`
-		}
-		// Re-parse le body (déjà consommé, donc on utilise une copie)
-		bodyBytes, _ := io.ReadAll(r.Body)
-		json.Unmarshal(bodyBytes, &tokenPayload)
-		turnstileToken = tokenPayload.TurnstileToken
-	}
+    // Détection de spam
+    if containsSpam(form.Message) {
+        log.Printf("⚠️ Spam détecté de %s", clientIP)
+        w.WriteHeader(http.StatusBadRequest)
+        json.NewEncoder(w).Encode(map[string]string{
+            "error": "Message rejeté (contenu suspect détecté)",
+        })
+        return
+    }
 
-	if !verifyTurnstile(turnstileToken, ip) {
-		log.Println("🚫 Échec vérification Turnstile")
-		http.Error(w, `{"error":"Vérification de sécurité échouée"}`, http.StatusForbidden)
-		return
-	}
+    // Vérification Turnstile
+    turnstileToken := r.FormValue("cf-turnstile-response")
+    if turnstileToken == "" {
+        // Essayer de le récupérer du JSON si présent
+        var jsonData map[string]string
+        r.Body = io.NopCloser(strings.NewReader("")) // Reset body
+        if err := json.NewDecoder(r.Body).Decode(&jsonData); err == nil {
+            turnstileToken = jsonData["cf-turnstile-response"]
+        }
+    }
 
-	// Envoi des emails
-	message, err := sendEmails(form)
-	if err != nil {
-		log.Println("❌ Erreur envoi email:", err)
-		http.Error(w, `{"error":"Erreur lors de l'envoi"}`, http.StatusInternalServerError)
-		return
-	}
+    if turnstileToken == "" {
+        log.Printf("⚠️ Token Turnstile manquant de %s", clientIP)
+        w.WriteHeader(http.StatusBadRequest)
+        json.NewEncoder(w).Encode(map[string]string{
+            "error": "Vérification anti-robot manquante",
+        })
+        return
+    }
 
-	// Réponse succès
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"status":  "success",
-		"message": message,
-	})
+    if !verifyTurnstile(turnstileToken, clientIP) {
+        log.Printf("❌ Échec vérification Turnstile pour %s", clientIP)
+        w.WriteHeader(http.StatusForbidden)
+        json.NewEncoder(w).Encode(map[string]string{
+            "error": "Échec de la vérification anti-robot",
+        })
+        return
+    }
 
-	log.Printf("✅ Contact traité avec succès: %s <%s>", form.Name, form.Email)
+    // Envoi de l'email
+    message, err := sendEmail(form)
+    if err != nil {
+        log.Printf("❌ Erreur envoi email: %v", err)
+        w.WriteHeader(http.StatusInternalServerError)
+        json.NewEncoder(w).Encode(map[string]string{
+            "error": "Erreur lors de l'envoi de l'email",
+        })
+        return
+    }
+
+    // Succès
+    log.Printf("✅ Message envoyé avec succès de %s (%s)", form.Name, form.Email)
+    w.WriteHeader(http.StatusOK)
+    json.NewEncoder(w).Encode(map[string]string{
+        "success": "true",
+        "message": message,
+    })
 }
 
-// --- Envoi des emails via Mailjet ---
-func sendEmails(form ContactForm) (string, error) {
-	apiKey := os.Getenv("MAILJET_API_KEY")
-	secretKey := os.Getenv("MAILJET_SECRET_KEY")
-	senderEmail := os.Getenv("SENDER_EMAIL")
-	senderName := os.Getenv("SENDER_NAME")
-	adminTo := os.Getenv("ADMIN_TO")
+// Handler pour la page d'accueil
+func homeHandler(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "text/html; charset=utf-8")
+    html := `
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Eldocam API</title>
+        <style>
+            body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }
+            h1 { color: #333; }
+            .endpoint { background: #f4f4f4; padding: 15px; margin: 10px 0; border-radius: 5px; }
+            code { background: #e0e0e0; padding: 2px 5px; border-radius: 3px; }
+        </style>
+    </head>
+    <body>
+        <h1>🚀 Eldocam Backend API</h1>
+        <p>Bienvenue sur l'API Eldocam</p>
+        
+        <div class="endpoint">
+            <h2>GET /health</h2>
+            <p>Vérifie l'état du serveur</p>
+        </div>
+        
+        <div class="endpoint">
+            <h2>POST /api/contact</h2>
+            <p>Envoie un message de contact</p>
+            <p><strong>Formats acceptés :</strong> <code>application/json</code> ou <code>application/x-www-form-urlencoded</code></p>
+            <p><strong>Champs requis :</strong> name, email, tel, message, language, cf-turnstile-response</p>
+        </div>
+    </body>
+    </html>
+    `
+    w.Write([]byte(html))
+}
 
-	if senderName == "" {
-		senderName = "Eldocam Contact Form"
-	}
+// Handler pour le health check
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(http.StatusOK)
+    json.NewEncoder(w).Encode(map[string]interface{}{
+        "status":    "healthy",
+        "timestamp": time.Now().Format(time.RFC3339),
+        "service":   "eldocam-backend",
+        "version":   "1.0.0",
+    })
+}
 
-	mailjetClient := mailjet.NewMailjetClient(apiKey, secretKey)
+// Chargement de la configuration
+func loadConfig() error {
+    // Charger .env si présent
+    godotenv.Load()
 
-	// Échapper les caractères HTML
-	escapedName := html.EscapeString(form.Name)
-	escapedEmail := html.EscapeString(form.Email)
-	escapedTel := html.EscapeString(form.Tel)
-	escapedMessage := html.EscapeString(form.Message)
+    config = Config{
+        MailjetAPIKey:    os.Getenv("MAILJET_API_KEY"),
+        MailjetSecretKey: os.Getenv("MAILJET_SECRET_KEY"),
+        SenderEmail:      os.Getenv("SENDER_EMAIL"),
+        SenderName:       os.Getenv("SENDER_NAME"),
+        AdminTo:          os.Getenv("ADMIN_TO"),
+        TurnstileSecret:  os.Getenv("TURNSTILE_SECRET"),
+    }
 
-	// Email pour l'admin
-	adminSubject := fmt.Sprintf("Nouveau contact depuis eldocam.com - %s", escapedName)
-	adminTextBody := fmt.Sprintf(`
-Nouveau message de contact reçu :
+    // Valeurs par défaut
+    if config.SenderEmail == "" {
+        config.SenderEmail = "noreply@eldocam.com"
+    }
+    if config.SenderName == "" {
+        config.SenderName = "Eldocam Contact"
+    }
+    if config.AdminTo == "" {
+        config.AdminTo = "smercier2000@gmail.com"
+    }
 
-Nom : %s
-Email : %s
-Téléphone : %s
-Langue : %s
+    // Vérifications
+    if config.MailjetAPIKey == "" || config.MailjetSecretKey == "" {
+        return fmt.Errorf("❌ MAILJET_API_KEY et MAILJET_SECRET_KEY sont requis")
+    }
 
-Message :
-%s
-`, escapedName, escapedEmail, escapedTel, form.Language, escapedMessage)
-
-	adminHTMLBody := fmt.Sprintf(`
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-</head>
-<body style="margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f5f5f5;">
-    <table role="presentation" style="width: 100%%; border-collapse: collapse;">
-        <tr>
-            <td align="center" style="padding: 40px 0;">
-                <table role="presentation" style="width: 600px; border-collapse: collapse; background-color: #ffffff; box-shadow: 0 4px 6px rgba(0,0,0,0.1); border-radius: 8px; overflow: hidden;">
-                    <tr>
-                        <td style="background: linear-gradient(135deg, #dc2626 0%%, #991b1b 100%%); padding: 30px; text-align: center;">
-                            <h1 style="margin: 0; color: #ffffff; font-size: 28px; font-weight: 600;">
-                                📧 Nouveau Contact
-                            </h1>
-                        </td>
-                    </tr>
-                    <tr>
-                        <td style="padding: 40px 30px;">
-                            <table role="presentation" style="width: 100%%; border-collapse: collapse;">
-                                <tr>
-                                    <td style="padding: 15px; background-color: #f9fafb; border-left: 4px solid #dc2626; margin-bottom: 15px;">
-                                        <p style="margin: 0 0 8px 0; color: #6b7280; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px;">
-                                            👤 Nom
-                                        </p>
-                                        <p style="margin: 0; color: #1a1a1a; font-size: 16px; font-weight: 600;">
-                                            %s
-                                        </p>
-                                    </td>
-                                </tr>
-                                <tr>
-                                    <td style="height: 15px;"></td>
-                                </tr>
-                                <tr>
-                                    <td style="padding: 15px; background-color: #f9fafb; border-left: 4px solid #dc2626; margin-bottom: 15px;">
-                                        <p style="margin: 0 0 8px 0; color: #6b7280; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px;">
-                                            ✉️ Email
-                                        </p>
-                                        <p style="margin: 0; color: #1a1a1a; font-size: 16px; font-weight: 600;">
-                                            <a href="mailto:%s" style="color: #dc2626; text-decoration: none;">%s</a>
-                                        </p>
-                                    </td>
-                                </tr>
-                                <tr>
-                                    <td style="height: 15px;"></td>
-                                </tr>
-                                <tr>
-                                    <td style="padding: 15px; background-color: #f9fafb; border-left: 4px solid #dc2626; margin-bottom: 15px;">
-                                        <p style="margin: 0 0 8px 0; color: #6b7280; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px;">
-                                            📞 Téléphone
-                                        </p>
-                                        <p style="margin: 0; color: #1a1a1a; font-size: 16px; font-weight: 600;">
-                                            %s
-                                        </p>
-                                    </td>
-                                </tr>
-                                <tr>
-                                    <td style="height: 15px;"></td>
-                                </tr>
-                                <tr>
-                                    <td style="padding: 15px; background-color: #f9fafb; border-left: 4px solid #dc2626; margin-bottom: 15px;">
-                                        <p style="margin: 0 0 8px 0; color: #6b7280; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px;">
-                                            🌍 Langue
-                                        </p>
-                                        <p style="margin: 0; color: #1a1a1a; font-size: 16px; font-weight: 600;">
-                                            %s
-                                        </p>
-                                    </td>
-                                </tr>
-                                <tr>
-                                    <td style="height: 15px;"></td>
-                                </tr>
-                                <tr>
-                                    <td style="padding: 20px; background-color: #fef2f2; border-left: 4px solid #dc2626; border-radius: 4px;">
-                                        <p style="margin: 0 0 12px 0; color: #6b7280; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px;">
-                                            💬 Message
-                                        </p>
-                                        <p style="margin: 0; color: #1a1a1a; font-size: 15px; line-height: 1.6; white-space: pre-wrap;">%s</p>
-                                    </td>
-                                </tr>
-                            </table>
-                        </td>
-                    </tr>
-                    <tr>
-                        <td style="background-color: #1a1a1a; padding: 20px; text-align: center;">
-                            <p style="margin: 0; color: #ffffff; font-size: 14px;">
-                                <strong style="color: #dc2626;">Eldocam</strong> - Système de contact
-                            </p>
-                            <p style="margin: 5px 0 0 0; color: #999; font-size: 12px;">
-                                Reçu le %s
-                            </p>
-                        </td>
-                    </tr>
-                </table>
-            </td>
-        </tr>
-    </table>
-</body>
-</html>
-    `, escapedName, escapedEmail, escapedEmail, escapedTel, form.Language, escapedMessage, time.Now().Format("02/01/2006 à 15:04"))
-
-	adminMessage := mailjet.InfoMessagesV31{
-		From: &mailjet.RecipientV31{
-			Email: senderEmail,
-			Name:  senderName,
-		},
-		To: &mailjet.RecipientsV31{
-			mailjet.RecipientV31{
-				Email: adminTo,
-			},
-		},
-		Subject:  adminSubject,
-		TextPart: adminTextBody,
-		HTMLPart: adminHTMLBody,
-	}
-
-	// Email de confirmation pour l'utilisateur
-	var confirmSubject, confirmTextBody, confirmHTMLBody string
-
-	switch strings.ToLower(form.Language) {
-	case "en":
-		confirmSubject = "Thank you for contacting Eldocam"
-		confirmTextBody = fmt.Sprintf(`
-Hello %s,
-
-Thank you for contacting us. We have received your message and will get back to you as soon as possible.
-
-Best regards,
-The Eldocam Team
-`, escapedName)
-		confirmHTMLBody = fmt.Sprintf(`
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-</head>
-<body style="margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f5f5f5;">
-    <table role="presentation" style="width: 100%%; border-collapse: collapse;">
-        <tr>
-            <td align="center" style="padding: 40px 0;">
-                <table role="presentation" style="width: 600px; border-collapse: collapse; background-color: #ffffff; box-shadow: 0 4px 6px rgba(0,0,0,0.1); border-radius: 8px; overflow: hidden;">
-                    <tr>
-                        <td style="background: linear-gradient(135deg, #dc2626 0%%, #991b1b 100%%); padding: 30px; text-align: center;">
-                            <h1 style="margin: 0; color: #ffffff; font-size: 28px; font-weight: 600;">
-                                ✅ Message Received
-                            </h1>
-                        </td>
-                    </tr>
-                    <tr>
-                        <td style="padding: 40px 30px;">
-                            <p style="margin: 0 0 15px 0; color: #1a1a1a; font-size: 18px;">
-                                Hello <strong style="color: #dc2626;">%s</strong>,
-                            </p>
-                            <p style="margin: 0 0 20px 0; color: #1a1a1a; font-size: 16px; line-height: 1.6;">
-                                Thank you for contacting us. We have received your message and will get back to you as soon as possible.
-                            </p>
-                            <p style="margin: 0; color: #1a1a1a; font-size: 16px; line-height: 1.6;">
-                                Best regards,<br>
-                                <strong style="color: #dc2626;">The Eldocam Team</strong>
-                            </p>
-                        </td>
-                    </tr>
-                    <tr>
-                        <td style="background-color: #1a1a1a; padding: 20px; text-align: center;">
-                            <p style="margin: 5px 0 0 0; color: #999; font-size: 12px;">
-                                This is an automated message, please do not reply.
-                            </p>
-                        </td>
-                    </tr>
-                </table>
-            </td>
-        </tr>
-    </table>
-</body>
-</html>
-        `, escapedName)
-
-	case "nl":
-		confirmSubject = "Bedankt voor uw contact met Eldocam"
-		confirmTextBody = fmt.Sprintf(`
-Hallo %s,
-
-Bedankt voor uw contact. We hebben uw bericht ontvangen en zullen zo spoedig mogelijk contact met u opnemen.
-
-Met vriendelijke groet,
-Het Eldocam Team
-`, escapedName)
-		confirmHTMLBody = fmt.Sprintf(`
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-</head>
-<body style="margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f5f5f5;">
-    <table role="presentation" style="width: 100%%; border-collapse: collapse;">
-        <tr>
-            <td align="center" style="padding: 40px 0;">
-                <table role="presentation" style="width: 600px; border-collapse: collapse; background-color: #ffffff; box-shadow: 0 4px 6px rgba(0,0,0,0.1); border-radius: 8px; overflow: hidden;">
-                    <tr>
-                        <td style="background: linear-gradient(135deg, #dc2626 0%%, #991b1b 100%%); padding: 30px; text-align: center;">
-                            <h1 style="margin: 0; color: #ffffff; font-size: 28px; font-weight: 600;">
-                                ✅ Bericht Ontvangen
-                            </h1>
-                        </td>
-                    </tr>
-                    <tr>
-                        <td style="padding: 40px 30px;">
-                            <p style="margin: 0 0 15px 0; color: #1a1a1a; font-size: 18px;">
-                                Hallo <strong style="color: #dc2626;">%s</strong>,
-                            </p>
-                            <p style="margin: 0 0 20px 0; color: #1a1a1a; font-size: 16px; line-height: 1.6;">
-                                Bedankt voor uw contact. We hebben uw bericht ontvangen en zullen zo spoedig mogelijk contact met u opnemen.
-                            </p>
-                            <p style="margin: 0; color: #1a1a1a; font-size: 16px; line-height: 1.6;">
-                                Met vriendelijke groet,<br>
-                                <strong style="color: #dc2626;">Het Eldocam Team</strong>
-                            </p>
-                        </td>
-                    </tr>
-                    <tr>
-                        <td style="background-color: #1a1a1a; padding: 20px; text-align: center;">
-                            <p style="margin: 5px 0 0 0; color: #999; font-size: 12px;">
-                                Dit is een automatisch bericht, gelieve niet te antwoorden.
-                            </p>
-                        </td>
-                    </tr>
-                </table>
-            </td>
-        </tr>
-    </table>
-</body>
-</html>
-        `, escapedName)
-
-	default: // Français par défaut
-		confirmSubject = "Merci de votre contact - Eldocam"
-		confirmTextBody = fmt.Sprintf(`
-Bonjour %s,
-
-Merci de nous avoir contactés. Nous avons bien reçu votre message et nous vous répondrons dans les plus brefs délais.
-
-Cordialement,
-L'équipe Eldocam
-`, escapedName)
-		confirmHTMLBody = fmt.Sprintf(`
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-</head>
-<body style="margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f5f5f5;">
-    <table role="presentation" style="width: 100%%; border-collapse: collapse;">
-        <tr>
-            <td align="center" style="padding: 40px 0;">
-                <table role="presentation" style="width: 600px; border-collapse: collapse; background-color: #ffffff; box-shadow: 0 4px 6px rgba(0,0,0,0.1); border-radius: 8px; overflow: hidden;">
-                    <tr>
-                        <td style="background: linear-gradient(135deg, #dc2626 0%%, #991b1b 100%%); padding: 30px; text-align: center;">
-                            <h1 style="margin: 0; color: #ffffff; font-size: 28px; font-weight: 600;">
-                                ✅ Message Reçu
-                            </h1>
-                        </td>
-                    </tr>
-                    <tr>
-                        <td style="padding: 40px 30px;">
-                            <p style="margin: 0 0 15px 0; color: #1a1a1a; font-size: 18px;">
-                                Bonjour <strong style="color: #dc2626;">%s</strong>,
-                            </p>
-                            <p style="margin: 0 0 20px 0; color: #1a1a1a; font-size: 16px; line-height: 1.6;">
-                                Merci de nous avoir contactés. Nous avons bien reçu votre message et nous vous répondrons dans les plus brefs délais.
-                            </p>
-                            <p style="margin: 0; color: #1a1a1a; font-size: 16px; line-height: 1.6;">
-                                Cordialement,<br>
-                                <strong style="color: #dc2626;">L'équipe Eldocam</strong>
-                            </p>
-                        </td>
-                    </tr>
-                    <tr>
-                        <td style="background-color: #1a1a1a; padding: 20px; text-align: center;">
-                            <p style="margin: 5px 0 0 0; color: #999; font-size: 12px;">
-                                Ceci est un message automatique, merci de ne pas y répondre.
-                            </p>
-                        </td>
-                    </tr>
-                </table>
-            </td>
-        </tr>
-    </table>
-</body>
-</html>
-        `, escapedName)
-	}
-
-	confirmMessage := mailjet.InfoMessagesV31{
-		From: &mailjet.RecipientV31{
-			Email: senderEmail,
-			Name:  senderName,
-		},
-		To: &mailjet.RecipientsV31{
-			mailjet.RecipientV31{
-				Email: form.Email,
-				Name:  form.Name,
-			},
-		},
-		Subject:  confirmSubject,
-		TextPart: confirmTextBody,
-		HTMLPart: confirmHTMLBody,
-	}
-
-	// Envoi des deux emails
-	messages := mailjet.MessagesV31{
-		Info: []mailjet.InfoMessagesV31{adminMessage, confirmMessage},
-	}
-
-	res, err := mailjetClient.SendMailV31(&messages)
-	if err != nil {
-		return "", fmt.Errorf("erreur Mailjet: %w", err)
-	}
-
-	if len(res.ResultsV31) > 0 {
-		firstResult := res.ResultsV31[0]
-		if firstResult.Status != "success" {
-			return "", fmt.Errorf("échec envoi email: statut=%s", firstResult.Status)
-		}
-	}
-
-	log.Printf("✅ Emails envoyés avec succès à %s et %s", adminTo, form.Email)
-
-	switch strings.ToLower(form.Language) {
-	case "en":
-		return "Message sent successfully!", nil
-	case "nl":
-		return "Bericht succesvol verzonden!", nil
-	default:
-		return "Message envoyé avec succès !", nil
-	}
+    log.Println("✅ Configuration chargée avec succès")
+    return nil
 }
 
 func main() {
-	// Charger le fichier .env (optionnel en production K8s)
-	if err := godotenv.Load(); err != nil {
-		log.Println("⚠️ Aucun fichier .env trouvé, utilisation des variables système")
-	}
+    // Chargement de la config
+    if err := loadConfig(); err != nil {
+        log.Fatal(err)
+    }
 
-	// Vérifier les variables d'environnement critiques
-	requiredVars := []string{
-		"MAILJET_API_KEY",
-		"MAILJET_SECRET_KEY",
-		"SENDER_EMAIL",
-		"ADMIN_TO",
-		"TURNSTILE_SECRET",
-	}
+    // Configuration CORS
+    c := cors.New(cors.Options{
+        AllowedOrigins:   []string{"https://eldocam.com", "https://www.eldocam.com", "http://localhost:3000"},
+        AllowedMethods:   []string{"GET", "POST", "OPTIONS"},
+        AllowedHeaders:   []string{"Content-Type", "Authorization"},
+        AllowCredentials: true,
+        MaxAge:           300,
+    })
 
-	for _, v := range requiredVars {
-		if os.Getenv(v) == "" {
-			log.Fatalf("❌ Variable d'environnement manquante: %s", v)
-		}
-	}
+    // Routes
+    mux := http.NewServeMux()
+    mux.HandleFunc("/", homeHandler)
+    mux.HandleFunc("/health", healthHandler)
+    mux.HandleFunc("/api/contact", contactHandler)
 
-	log.Println("✅ Configuration chargée avec succès")
+    // Application du CORS
+    handler := c.Handler(mux)
 
-	// Configuration CORS sécurisée
-	corsHandler := cors.New(cors.Options{
-		AllowedOrigins: []string{
-			"https://eldocam.com",
-			"https://eldocam.be",
-			"https://www.eldocam.com",
-			"https://www.eldocam.be",
-			"http://localhost:3000",
-		},
-		AllowedMethods:   []string{"POST", "OPTIONS"},
-		AllowedHeaders:   []string{"Content-Type", "X-Requested-With"},
-		AllowCredentials: false,
-		MaxAge:           3600,
-	})
+    // Démarrage du serveur
+    port := os.Getenv("PORT")
+    if port == "" {
+        port = "8000"
+    }
 
-	// ✅ Routes corrigées
-	http.HandleFunc("/health", healthHandler)
-	http.Handle("/api/contact", corsHandler.Handler(http.HandlerFunc(contactHandler)))
-	http.HandleFunc("/", rootHandler)
+    log.Printf("🚀 Serveur démarré sur le port %s", port)
+    log.Println("📍 Routes actives:")
+    log.Println("   GET  /health")
+    log.Println("   POST /api/contact")
+    log.Println("   GET  /")
+    log.Printf("🔒 Rate limiting: %d requêtes max par IP / %v", maxRequests, timeWindow)
+    log.Println("🛡️ Cloudflare Turnstile: Activé")
+    log.Println("🚫 Détection de spam: Activée")
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8000"
-	}
-
-	log.Printf("🚀 Serveur démarré sur le port %s", port)
-	log.Printf("📍 Routes actives:")
-	log.Printf("   GET  /health")
-	log.Printf("   POST /api/contact")
-	log.Printf("   GET  /")
-	log.Printf("🔒 Rate limiting: 3 requêtes max par IP / 10 minutes")
-	log.Printf("🛡️ Cloudflare Turnstile: Activé")
-	log.Printf("🚫 Détection de spam: Activée")
-
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
-		log.Fatal("❌ Erreur serveur:", err)
-	}
+    if err := http.ListenAndServe(":"+port, handler); err != nil {
+        log.Fatal("❌ Erreur serveur:", err)
+    }
 }
