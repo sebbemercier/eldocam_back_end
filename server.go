@@ -44,6 +44,20 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// --- Root Handler (documentation) ---
+func rootHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"service": "Eldocam Backend API",
+		"version": "1.0.0",
+		"status":  "operational",
+		"endpoints": map[string]string{
+			"health":  "GET /health",
+			"contact": "POST /api/contact",
+		},
+	})
+}
+
 // --- Fonction de rate limiting (max 3 requêtes par IP toutes les 10 min) ---
 func isRateLimited(ip string) bool {
 	rateLimitMutex.Lock()
@@ -154,180 +168,115 @@ func verifyTurnstile(token, ip string) bool {
 
 	success, ok := result["success"].(bool)
 	if !ok || !success {
-		log.Println("❌ Vérification Turnstile échouée:", result)
-	}
-	return ok && success
-}
-
-// --- Handler pour le formulaire de contact ---
-func contactHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Méthode non autorisée", http.StatusMethodNotAllowed)
-		return
-	}
-
-	// Récupération de l'IP réelle
-	ip := r.Header.Get("X-Forwarded-For")
-	if ip == "" {
-		ip = r.Header.Get("X-Real-IP")
-	}
-	if ip == "" {
-		ip = strings.Split(r.RemoteAddr, ":")[0]
-	}
-
-	log.Printf("📩 Nouvelle requête de contact depuis %s", ip)
-
-	// 🔒 Rate limiting
-	if isRateLimited(ip) {
-		log.Printf("🚫 Trop de requêtes depuis %s", ip)
-		http.Error(w, "Trop de requêtes. Veuillez réessayer plus tard.", http.StatusTooManyRequests)
-		return
-	}
-
-	// Détecter le Content-Type
-	contentType := r.Header.Get("Content-Type")
-	log.Printf("📋 Content-Type: %s", contentType)
-
-	var form ContactForm
-	var turnstileToken string
-
-	if strings.Contains(contentType, "application/json") {
-		// Format JSON
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			log.Println("❌ Erreur lecture body:", err)
-			http.Error(w, "Erreur de lecture des données", http.StatusBadRequest)
-			return
-		}
-		defer r.Body.Close()
-
-		type RequestWithToken struct {
-			Name           string `json:"name"`
-			Email          string `json:"email"`
-			Tel            string `json:"tel"`
-			Language       string `json:"language"`
-			Message        string `json:"message"`
-			TurnstileToken string `json:"cf-turnstile-response"`
-		}
-
-		var requestData RequestWithToken
-		if err := json.Unmarshal(body, &requestData); err != nil {
-			log.Println("❌ Erreur décodage JSON:", err)
-			http.Error(w, "Données JSON invalides", http.StatusBadRequest)
-			return
-		}
-
-		form = ContactForm{
-			Name:     requestData.Name,
-			Email:    requestData.Email,
-			Tel:      requestData.Tel,
-			Language: requestData.Language,
-			Message:  requestData.Message,
-		}
-		turnstileToken = requestData.TurnstileToken
-
-	} else {
-		// Format application/x-www-form-urlencoded
-		if err := r.ParseForm(); err != nil {
-			log.Println("❌ Erreur parsing formulaire:", err)
-			http.Error(w, "Erreur de parsing", http.StatusBadRequest)
-			return
-		}
-
-		form = ContactForm{
-			Name:     r.FormValue("name"),
-			Email:    r.FormValue("email"),
-			Tel:      r.FormValue("tel"),
-			Language: r.FormValue("language"),
-			Message:  r.FormValue("message"),
-		}
-		turnstileToken = r.FormValue("cf-turnstile-response")
-	}
-
-	// 🔒 Vérification Turnstile OBLIGATOIRE
-	if turnstileToken == "" {
-		log.Println("❌ Token Turnstile manquant")
-		http.Error(w, "Vérification de sécurité manquante.", http.StatusBadRequest)
-		return
-	}
-
-	if !verifyTurnstile(turnstileToken, ip) {
 		log.Println("❌ Vérification Turnstile échouée")
-		http.Error(w, "Vérification de sécurité échouée.", http.StatusBadRequest)
-		return
+		return false
 	}
 
 	log.Println("✅ Vérification Turnstile réussie")
+	return true
+}
 
-	// Nettoyage et validation des champs
-	form.Name = strings.TrimSpace(form.Name)
-	form.Email = strings.TrimSpace(strings.ToLower(form.Email))
-	form.Tel = strings.TrimSpace(form.Tel)
-	form.Message = strings.TrimSpace(form.Message)
+// --- Handler principal du formulaire de contact ---
+func contactHandler(w http.ResponseWriter, r *http.Request) {
+	// Accepter uniquement POST
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"Méthode non autorisée"}`, http.StatusMethodNotAllowed)
+		return
+	}
 
-	if form.Name == "" || len(form.Name) < 2 || len(form.Name) > 80 {
-		log.Println("❌ Nom invalide")
-		http.Error(w, "Le nom doit contenir entre 2 et 80 caractères", http.StatusBadRequest)
+	// Rate limiting par IP
+	ip := r.RemoteAddr
+	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+		ip = strings.Split(forwarded, ",")[0]
+	}
+
+	if isRateLimited(ip) {
+		log.Printf("🚫 Rate limit pour IP: %s", ip)
+		http.Error(w, `{"error":"Trop de requêtes. Réessayez plus tard."}`, http.StatusTooManyRequests)
+		return
+	}
+
+	// Parser le JSON
+	var form ContactForm
+	if err := json.NewDecoder(r.Body).Decode(&form); err != nil {
+		log.Println("❌ Erreur parsing JSON:", err)
+		http.Error(w, `{"error":"Format JSON invalide"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Validation des champs
+	if len(form.Name) < 2 || len(form.Name) > 80 {
+		http.Error(w, `{"error":"Le nom doit contenir entre 2 et 80 caractères"}`, http.StatusBadRequest)
 		return
 	}
 
 	if !isValidEmail(form.Email) {
-		log.Println("❌ Email invalide:", form.Email)
-		http.Error(w, "Email invalide", http.StatusBadRequest)
+		http.Error(w, `{"error":"Adresse email invalide"}`, http.StatusBadRequest)
 		return
 	}
 
-	if len(form.Tel) > 40 {
-		log.Println("❌ Téléphone trop long")
-		http.Error(w, "Numéro de téléphone trop long", http.StatusBadRequest)
+	if len(form.Message) < 3 || len(form.Message) > 5000 {
+		http.Error(w, `{"error":"Le message doit contenir entre 3 et 5000 caractères"}`, http.StatusBadRequest)
 		return
 	}
 
-	if form.Message == "" || len(form.Message) < 3 || len(form.Message) > 5000 {
-		log.Println("❌ Message invalide (longueur)")
-		http.Error(w, "Le message doit contenir entre 3 et 5000 caractères", http.StatusBadRequest)
-		return
-	}
-
-	// 🔒 Détection de spam
+	// Détection de spam
 	if containsSpam(form.Message) {
-		log.Printf("🚫 Spam détecté depuis %s", ip)
-		http.Error(w, "Message non autorisé", http.StatusForbidden)
+		log.Println("🚫 Message suspect détecté")
+		http.Error(w, `{"error":"Message suspect détecté"}`, http.StatusBadRequest)
 		return
 	}
 
-	log.Printf("✅ Formulaire valide de %s (%s)", form.Name, form.Email)
+	// Vérification Cloudflare Turnstile
+	turnstileToken := r.Header.Get("cf-turnstile-response")
+	if turnstileToken == "" {
+		// Essayer de récupérer depuis le body JSON
+		var tokenPayload struct {
+			TurnstileToken string `json:"cf-turnstile-response"`
+		}
+		// Re-parse le body (déjà consommé, donc on utilise une copie)
+		bodyBytes, _ := io.ReadAll(r.Body)
+		json.Unmarshal(bodyBytes, &tokenPayload)
+		turnstileToken = tokenPayload.TurnstileToken
+	}
 
-	// Envoi de l'email
-	mailjetAPIKey := os.Getenv("MAILJET_API_KEY")
-	mailjetSecretKey := os.Getenv("MAILJET_SECRET_KEY")
+	if !verifyTurnstile(turnstileToken, ip) {
+		log.Println("🚫 Échec vérification Turnstile")
+		http.Error(w, `{"error":"Vérification de sécurité échouée"}`, http.StatusForbidden)
+		return
+	}
+
+	// Envoi des emails
+	message, err := sendEmails(form)
+	if err != nil {
+		log.Println("❌ Erreur envoi email:", err)
+		http.Error(w, `{"error":"Erreur lors de l'envoi"}`, http.StatusInternalServerError)
+		return
+	}
+
+	// Réponse succès
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":  "success",
+		"message": message,
+	})
+
+	log.Printf("✅ Contact traité avec succès: %s <%s>", form.Name, form.Email)
+}
+
+// --- Envoi des emails via Mailjet ---
+func sendEmails(form ContactForm) (string, error) {
+	apiKey := os.Getenv("MAILJET_API_KEY")
+	secretKey := os.Getenv("MAILJET_SECRET_KEY")
 	senderEmail := os.Getenv("SENDER_EMAIL")
 	senderName := os.Getenv("SENDER_NAME")
 	adminTo := os.Getenv("ADMIN_TO")
 
-	if mailjetAPIKey == "" || mailjetSecretKey == "" || senderEmail == "" || adminTo == "" {
-		log.Println("❌ Variables d'environnement manquantes")
-		http.Error(w, "Configuration serveur incomplète", http.StatusInternalServerError)
-		return
+	if senderName == "" {
+		senderName = "Eldocam Contact Form"
 	}
 
-	successMsg, err := sendEmail(form, mailjetAPIKey, mailjetSecretKey, senderEmail, senderName, adminTo)
-	if err != nil {
-		log.Println("❌ Erreur lors de l'envoi:", err)
-		http.Error(w, "Erreur lors de l'envoi du message", http.StatusInternalServerError)
-		return
-	}
-
-	// Réponse JSON avec message traduit
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"message": successMsg,
-	})
-}
-
-// --- Envoi d'email via Mailjet ---
-func sendEmail(form ContactForm, mailjetAPIKey, mailjetSecretKey, senderEmail, senderName, adminTo string) (string, error) {
-	mailjetClient := mailjet.NewMailjetClient(mailjetAPIKey, mailjetSecretKey)
+	mailjetClient := mailjet.NewMailjetClient(apiKey, secretKey)
 
 	// Échapper les caractères HTML
 	escapedName := html.EscapeString(form.Name)
@@ -336,80 +285,111 @@ func sendEmail(form ContactForm, mailjetAPIKey, mailjetSecretKey, senderEmail, s
 	escapedMessage := html.EscapeString(form.Message)
 
 	// Email pour l'admin
-	adminSubject := fmt.Sprintf("📩 Nouveau message de %s", escapedName)
+	adminSubject := fmt.Sprintf("Nouveau contact depuis eldocam.com - %s", escapedName)
+	adminTextBody := fmt.Sprintf(`
+Nouveau message de contact reçu :
+
+Nom : %s
+Email : %s
+Téléphone : %s
+Langue : %s
+
+Message :
+%s
+`, escapedName, escapedEmail, escapedTel, form.Language, escapedMessage)
+
 	adminHTMLBody := fmt.Sprintf(`
 <!DOCTYPE html>
-<html lang="fr">
+<html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Nouveau message</title>
 </head>
-<body style="margin: 0; padding: 0; font-family: Arial, sans-serif; background-color: #f4f4f4;">
-    <table role="presentation" width="100%%" cellspacing="0" cellpadding="0" style="background-color: #f4f4f4; padding: 20px 0;">
+<body style="margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f5f5f5;">
+    <table role="presentation" style="width: 100%%; border-collapse: collapse;">
         <tr>
-            <td align="center">
-                <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
-                    <!-- Header -->
+            <td align="center" style="padding: 40px 0;">
+                <table role="presentation" style="width: 600px; border-collapse: collapse; background-color: #ffffff; box-shadow: 0 4px 6px rgba(0,0,0,0.1); border-radius: 8px; overflow: hidden;">
                     <tr>
                         <td style="background: linear-gradient(135deg, #dc2626 0%%, #991b1b 100%%); padding: 30px; text-align: center;">
-                            <h1 style="margin: 0; color: #ffffff; font-size: 28px; font-weight: bold;">
-                                📩 Nouveau Message
+                            <h1 style="margin: 0; color: #ffffff; font-size: 28px; font-weight: 600;">
+                                📧 Nouveau Contact
                             </h1>
                         </td>
                     </tr>
-
-                    <!-- Content -->
                     <tr>
                         <td style="padding: 40px 30px;">
-                            <h2 style="margin: 0 0 20px 0; color: #1a1a1a; font-size: 20px;">
-                                Informations du contact
-                            </h2>
-                            
-                            <table role="presentation" width="100%%" cellspacing="0" cellpadding="10" style="margin-bottom: 20px;">
-                                <tr style="background-color: #f9fafb;">
-                                    <td style="padding: 12px; font-weight: bold; color: #374151; border-bottom: 1px solid #e5e7eb;">
-                                        Nom :
-                                    </td>
-                                    <td style="padding: 12px; color: #1a1a1a; border-bottom: 1px solid #e5e7eb;">
-                                        %s
+                            <table role="presentation" style="width: 100%%; border-collapse: collapse;">
+                                <tr>
+                                    <td style="padding: 15px; background-color: #f9fafb; border-left: 4px solid #dc2626; margin-bottom: 15px;">
+                                        <p style="margin: 0 0 8px 0; color: #6b7280; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px;">
+                                            👤 Nom
+                                        </p>
+                                        <p style="margin: 0; color: #1a1a1a; font-size: 16px; font-weight: 600;">
+                                            %s
+                                        </p>
                                     </td>
                                 </tr>
                                 <tr>
-                                    <td style="padding: 12px; font-weight: bold; color: #374151; border-bottom: 1px solid #e5e7eb;">
-                                        Email :
-                                    </td>
-                                    <td style="padding: 12px; border-bottom: 1px solid #e5e7eb;">
-                                        <a href="mailto:%s" style="color: #dc2626; text-decoration: none;">%s</a>
+                                    <td style="height: 15px;"></td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 15px; background-color: #f9fafb; border-left: 4px solid #dc2626; margin-bottom: 15px;">
+                                        <p style="margin: 0 0 8px 0; color: #6b7280; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px;">
+                                            ✉️ Email
+                                        </p>
+                                        <p style="margin: 0; color: #1a1a1a; font-size: 16px; font-weight: 600;">
+                                            <a href="mailto:%s" style="color: #dc2626; text-decoration: none;">%s</a>
+                                        </p>
                                     </td>
                                 </tr>
-                                <tr style="background-color: #f9fafb;">
-                                    <td style="padding: 12px; font-weight: bold; color: #374151; border-bottom: 1px solid #e5e7eb;">
-                                        Téléphone :
+                                <tr>
+                                    <td style="height: 15px;"></td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 15px; background-color: #f9fafb; border-left: 4px solid #dc2626; margin-bottom: 15px;">
+                                        <p style="margin: 0 0 8px 0; color: #6b7280; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px;">
+                                            📞 Téléphone
+                                        </p>
+                                        <p style="margin: 0; color: #1a1a1a; font-size: 16px; font-weight: 600;">
+                                            %s
+                                        </p>
                                     </td>
-                                    <td style="padding: 12px; color: #1a1a1a; border-bottom: 1px solid #e5e7eb;">
-                                        %s
+                                </tr>
+                                <tr>
+                                    <td style="height: 15px;"></td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 15px; background-color: #f9fafb; border-left: 4px solid #dc2626; margin-bottom: 15px;">
+                                        <p style="margin: 0 0 8px 0; color: #6b7280; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px;">
+                                            🌍 Langue
+                                        </p>
+                                        <p style="margin: 0; color: #1a1a1a; font-size: 16px; font-weight: 600;">
+                                            %s
+                                        </p>
+                                    </td>
+                                </tr>
+                                <tr>
+                                    <td style="height: 15px;"></td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 20px; background-color: #fef2f2; border-left: 4px solid #dc2626; border-radius: 4px;">
+                                        <p style="margin: 0 0 12px 0; color: #6b7280; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px;">
+                                            💬 Message
+                                        </p>
+                                        <p style="margin: 0; color: #1a1a1a; font-size: 15px; line-height: 1.6; white-space: pre-wrap;">%s</p>
                                     </td>
                                 </tr>
                             </table>
-
-                            <h2 style="margin: 30px 0 15px 0; color: #1a1a1a; font-size: 20px;">
-                                Message
-                            </h2>
-                            <div style="background-color: #f9fafb; border-left: 4px solid #dc2626; padding: 20px; border-radius: 4px;">
-                                <p style="margin: 0; color: #1a1a1a; font-size: 16px; line-height: 1.6; white-space: pre-wrap;">%s</p>
-                            </div>
                         </td>
                     </tr>
-
-                    <!-- Footer -->
                     <tr>
                         <td style="background-color: #1a1a1a; padding: 20px; text-align: center;">
                             <p style="margin: 0; color: #ffffff; font-size: 14px;">
-                                <strong style="color: #dc2626;">Eldocam</strong> - Système de contact automatisé
+                                <strong style="color: #dc2626;">Eldocam</strong> - Système de contact
                             </p>
                             <p style="margin: 5px 0 0 0; color: #999; font-size: 12px;">
-                                Envoyé le %s
+                                Reçu le %s
                             </p>
                         </td>
                     </tr>
@@ -419,7 +399,7 @@ func sendEmail(form ContactForm, mailjetAPIKey, mailjetSecretKey, senderEmail, s
     </table>
 </body>
 </html>
-    `, escapedName, escapedEmail, escapedEmail, escapedTel, escapedMessage, time.Now().Format("02/01/2006 à 15:04"))
+    `, escapedName, escapedEmail, escapedEmail, escapedTel, form.Language, escapedMessage, time.Now().Format("02/01/2006 à 15:04"))
 
 	adminMessage := mailjet.InfoMessagesV31{
 		From: &mailjet.RecipientV31{
@@ -432,27 +412,41 @@ func sendEmail(form ContactForm, mailjetAPIKey, mailjetSecretKey, senderEmail, s
 			},
 		},
 		Subject:  adminSubject,
+		TextPart: adminTextBody,
 		HTMLPart: adminHTMLBody,
 	}
 
-	// Email de confirmation pour le client
+	// Email de confirmation pour l'utilisateur
 	var confirmSubject, confirmTextBody, confirmHTMLBody string
 
 	switch strings.ToLower(form.Language) {
 	case "en":
-		confirmSubject = "✅ Message Received - Eldocam"
-		confirmTextBody = fmt.Sprintf("Hello %s,\n\nThank you for contacting us. We have received your message and will respond as soon as possible.\n\nBest regards,\nThe Eldocam Team", escapedName)
+		confirmSubject = "Thank you for contacting Eldocam"
+		confirmTextBody = fmt.Sprintf(`
+Hello %s,
+
+Thank you for contacting us. We have received your message and will get back to you as soon as possible.
+
+Best regards,
+The Eldocam Team
+`, escapedName)
 		confirmHTMLBody = fmt.Sprintf(`
 <!DOCTYPE html>
-<html lang="en">
-<body style="margin: 0; padding: 0; font-family: Arial, sans-serif; background-color: #f4f4f4;">
-    <table role="presentation" width="100%%" cellspacing="0" cellpadding="0" style="background-color: #f4f4f4; padding: 20px 0;">
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f5f5f5;">
+    <table role="presentation" style="width: 100%%; border-collapse: collapse;">
         <tr>
-            <td align="center">
-                <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+            <td align="center" style="padding: 40px 0;">
+                <table role="presentation" style="width: 600px; border-collapse: collapse; background-color: #ffffff; box-shadow: 0 4px 6px rgba(0,0,0,0.1); border-radius: 8px; overflow: hidden;">
                     <tr>
                         <td style="background: linear-gradient(135deg, #dc2626 0%%, #991b1b 100%%); padding: 30px; text-align: center;">
-                            <h1 style="margin: 0; color: #ffffff; font-size: 28px; font-weight: bold;">✅ Message Received</h1>
+                            <h1 style="margin: 0; color: #ffffff; font-size: 28px; font-weight: 600;">
+                                ✅ Message Received
+                            </h1>
                         </td>
                     </tr>
                     <tr>
@@ -461,7 +455,7 @@ func sendEmail(form ContactForm, mailjetAPIKey, mailjetSecretKey, senderEmail, s
                                 Hello <strong style="color: #dc2626;">%s</strong>,
                             </p>
                             <p style="margin: 0 0 20px 0; color: #1a1a1a; font-size: 16px; line-height: 1.6;">
-                                Thank you for contacting us. We have received your message and will respond as soon as possible.
+                                Thank you for contacting us. We have received your message and will get back to you as soon as possible.
                             </p>
                             <p style="margin: 0; color: #1a1a1a; font-size: 16px; line-height: 1.6;">
                                 Best regards,<br>
@@ -485,19 +479,32 @@ func sendEmail(form ContactForm, mailjetAPIKey, mailjetSecretKey, senderEmail, s
         `, escapedName)
 
 	case "nl":
-		confirmSubject = "✅ Bericht Ontvangen - Eldocam"
-		confirmTextBody = fmt.Sprintf("Hallo %s,\n\nBedankt voor uw contact. We hebben uw bericht ontvangen en zullen zo snel mogelijk reageren.\n\nMet vriendelijke groet,\nHet Eldocam Team", escapedName)
+		confirmSubject = "Bedankt voor uw contact met Eldocam"
+		confirmTextBody = fmt.Sprintf(`
+Hallo %s,
+
+Bedankt voor uw contact. We hebben uw bericht ontvangen en zullen zo spoedig mogelijk contact met u opnemen.
+
+Met vriendelijke groet,
+Het Eldocam Team
+`, escapedName)
 		confirmHTMLBody = fmt.Sprintf(`
 <!DOCTYPE html>
-<html lang="nl">
-<body style="margin: 0; padding: 0; font-family: Arial, sans-serif; background-color: #f4f4f4;">
-    <table role="presentation" width="100%%" cellspacing="0" cellpadding="0" style="background-color: #f4f4f4; padding: 20px 0;">
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f5f5f5;">
+    <table role="presentation" style="width: 100%%; border-collapse: collapse;">
         <tr>
-            <td align="center">
-                <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+            <td align="center" style="padding: 40px 0;">
+                <table role="presentation" style="width: 600px; border-collapse: collapse; background-color: #ffffff; box-shadow: 0 4px 6px rgba(0,0,0,0.1); border-radius: 8px; overflow: hidden;">
                     <tr>
                         <td style="background: linear-gradient(135deg, #dc2626 0%%, #991b1b 100%%); padding: 30px; text-align: center;">
-                            <h1 style="margin: 0; color: #ffffff; font-size: 28px; font-weight: bold;">✅ Bericht Ontvangen</h1>
+                            <h1 style="margin: 0; color: #ffffff; font-size: 28px; font-weight: 600;">
+                                ✅ Bericht Ontvangen
+                            </h1>
                         </td>
                     </tr>
                     <tr>
@@ -506,7 +513,7 @@ func sendEmail(form ContactForm, mailjetAPIKey, mailjetSecretKey, senderEmail, s
                                 Hallo <strong style="color: #dc2626;">%s</strong>,
                             </p>
                             <p style="margin: 0 0 20px 0; color: #1a1a1a; font-size: 16px; line-height: 1.6;">
-                                Bedankt voor uw contact. We hebben uw bericht ontvangen en zullen zo snel mogelijk reageren.
+                                Bedankt voor uw contact. We hebben uw bericht ontvangen en zullen zo spoedig mogelijk contact met u opnemen.
                             </p>
                             <p style="margin: 0; color: #1a1a1a; font-size: 16px; line-height: 1.6;">
                                 Met vriendelijke groet,<br>
@@ -517,7 +524,7 @@ func sendEmail(form ContactForm, mailjetAPIKey, mailjetSecretKey, senderEmail, s
                     <tr>
                         <td style="background-color: #1a1a1a; padding: 20px; text-align: center;">
                             <p style="margin: 5px 0 0 0; color: #999; font-size: 12px;">
-                                Dit is een geautomatiseerd bericht, gelieve niet te antwoorden.
+                                Dit is een automatisch bericht, gelieve niet te antwoorden.
                             </p>
                         </td>
                     </tr>
@@ -529,20 +536,33 @@ func sendEmail(form ContactForm, mailjetAPIKey, mailjetSecretKey, senderEmail, s
 </html>
         `, escapedName)
 
-	default:
-		confirmSubject = "✅ Message Reçu - Eldocam"
-		confirmTextBody = fmt.Sprintf("Bonjour %s,\n\nMerci de nous avoir contactés. Nous avons bien reçu votre message et vous répondrons dans les plus brefs délais.\n\nCordialement,\nL'équipe Eldocam", escapedName)
+	default: // Français par défaut
+		confirmSubject = "Merci de votre contact - Eldocam"
+		confirmTextBody = fmt.Sprintf(`
+Bonjour %s,
+
+Merci de nous avoir contactés. Nous avons bien reçu votre message et nous vous répondrons dans les plus brefs délais.
+
+Cordialement,
+L'équipe Eldocam
+`, escapedName)
 		confirmHTMLBody = fmt.Sprintf(`
 <!DOCTYPE html>
-<html lang="fr">
-<body style="margin: 0; padding: 0; font-family: Arial, sans-serif; background-color: #f4f4f4;">
-    <table role="presentation" width="100%%" cellspacing="0" cellpadding="0" style="background-color: #f4f4f4; padding: 20px 0;">
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f5f5f5;">
+    <table role="presentation" style="width: 100%%; border-collapse: collapse;">
         <tr>
-            <td align="center">
-                <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+            <td align="center" style="padding: 40px 0;">
+                <table role="presentation" style="width: 600px; border-collapse: collapse; background-color: #ffffff; box-shadow: 0 4px 6px rgba(0,0,0,0.1); border-radius: 8px; overflow: hidden;">
                     <tr>
                         <td style="background: linear-gradient(135deg, #dc2626 0%%, #991b1b 100%%); padding: 30px; text-align: center;">
-                            <h1 style="margin: 0; color: #ffffff; font-size: 28px; font-weight: bold;">✅ Message Reçu</h1>
+                            <h1 style="margin: 0; color: #ffffff; font-size: 28px; font-weight: 600;">
+                                ✅ Message Reçu
+                            </h1>
                         </td>
                     </tr>
                     <tr>
@@ -658,9 +678,10 @@ func main() {
 		MaxAge:           3600,
 	})
 
-	// Enregistrer les routes
+	// ✅ Routes corrigées
 	http.HandleFunc("/health", healthHandler)
-	http.Handle("/", corsHandler.Handler(http.HandlerFunc(contactHandler)))
+	http.Handle("/api/contact", corsHandler.Handler(http.HandlerFunc(contactHandler)))
+	http.HandleFunc("/", rootHandler)
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -668,6 +689,10 @@ func main() {
 	}
 
 	log.Printf("🚀 Serveur démarré sur le port %s", port)
+	log.Printf("📍 Routes actives:")
+	log.Printf("   GET  /health")
+	log.Printf("   POST /api/contact")
+	log.Printf("   GET  /")
 	log.Printf("🔒 Rate limiting: 3 requêtes max par IP / 10 minutes")
 	log.Printf("🛡️ Cloudflare Turnstile: Activé")
 	log.Printf("🚫 Détection de spam: Activée")
