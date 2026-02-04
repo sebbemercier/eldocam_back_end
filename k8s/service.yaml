@@ -5,8 +5,9 @@ metadata:
   namespace: eldocam
 spec:
   selector:
-    app: eldocam-backend
+    app: eldocam-backend  # ⚠️ Doit matcher les labels du deployment
   ports:
-  - port: 80
+  - protocol: TCP
+    port: 80
     targetPort: 8000
   type: ClusterIP
