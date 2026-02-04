@@ -1,0 +1,76 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: eldocam-backend
+  namespace: eldocam
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: eldocam-backend
+  template:
+    metadata:
+      labels:
+        app: eldocam-backend
+    spec:
+      containers:
+      - name: backend
+        image: ghcr.io/sebbemercier/eldocam-backend:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8000
+        env:
+        - name: PORT
+          valueFrom:
+            secretKeyRef:
+              name: eldocam-backend-secrets
+              key: PORT
+        - name: MAILJET_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: eldocam-backend-secrets
+              key: MAILJET_API_KEY
+        - name: MAILJET_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: eldocam-backend-secrets
+              key: MAILJET_SECRET_KEY
+        - name: SENDER_EMAIL
+          valueFrom:
+            secretKeyRef:
+              name: eldocam-backend-secrets
+              key: SENDER_EMAIL
+        - name: SENDER_NAME
+          valueFrom:
+            secretKeyRef:
+              name: eldocam-backend-secrets
+              key: SENDER_NAME
+        - name: ADMIN_TO
+          valueFrom:
+            secretKeyRef:
+              name: eldocam-backend-secrets
+              key: ADMIN_TO
+        - name: TURNSTILE_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: eldocam-backend-secrets
+              key: TURNSTILE_SECRET
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 10

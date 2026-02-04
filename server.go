@@ -34,6 +34,16 @@ type ContactForm struct {
     Message  string `json:"message" validate:"required,min=3,max=5000"`
 }
 
+// --- Health Check Handler (pour Kubernetes) ---
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+    w.WriteHeader(http.StatusOK)
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]string{
+        "status": "healthy",
+        "time":   time.Now().Format(time.RFC3339),
+    })
+}
+
 // --- Fonction de rate limiting (max 3 requêtes par IP toutes les 10 min) ---
 func isRateLimited(ip string) bool {
     rateLimitMutex.Lock()
@@ -149,7 +159,6 @@ func verifyTurnstile(token, ip string) bool {
     return ok && success
 }
 
-// --- Handler pour le formulaire de contact ---
 // --- Handler pour le formulaire de contact ---
 func contactHandler(w http.ResponseWriter, r *http.Request) {
     if r.Method != http.MethodPost {
@@ -316,83 +325,91 @@ func contactHandler(w http.ResponseWriter, r *http.Request) {
     })
 }
 
-
-
 // --- Envoi d'email via Mailjet ---
 func sendEmail(form ContactForm, mailjetAPIKey, mailjetSecretKey, senderEmail, senderName, adminTo string) (string, error) {
     mailjetClient := mailjet.NewMailjetClient(mailjetAPIKey, mailjetSecretKey)
 
+    // Échapper les caractères HTML
     escapedName := html.EscapeString(form.Name)
     escapedEmail := html.EscapeString(form.Email)
     escapedTel := html.EscapeString(form.Tel)
-    escapedMsg := html.EscapeString(form.Message)
-    escapedMsgHTML := strings.ReplaceAll(escapedMsg, "\n", "<br>")
+    escapedMessage := html.EscapeString(form.Message)
 
-    // --- 1. Mail à l'admin (Design rouge/noir professionnel) ---
-    adminTextBody := fmt.Sprintf(
-        "Nom: %s\nEmail: %s\nTel: %s\n\nMessage:\n%s",
-        form.Name, form.Email, form.Tel, form.Message,
-    )
-
+    // Email pour l'admin
+    adminSubject := fmt.Sprintf("📩 Nouveau message de %s", escapedName)
     adminHTMLBody := fmt.Sprintf(`
 <!DOCTYPE html>
-<html>
+<html lang="fr">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nouveau message</title>
 </head>
-<body style="margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #1a1a1a;">
-    <table width="100%%" cellpadding="0" cellspacing="0" style="background-color: #1a1a1a; padding: 20px;">
+<body style="margin: 0; padding: 0; font-family: Arial, sans-serif; background-color: #f4f4f4;">
+    <table role="presentation" width="100%%" cellspacing="0" cellpadding="0" style="background-color: #f4f4f4; padding: 20px 0;">
         <tr>
             <td align="center">
-                <table width="600" cellpadding="0" cellspacing="0" style="background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.3);">
+                <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
                     <!-- Header -->
                     <tr>
-                        <td style="background: linear-gradient(135deg, #dc2626 0%%, #991b1b 100%%); padding: 30px 40px; text-align: center;">
-                            <h1 style="margin: 0; color: #ffffff; font-size: 24px; font-weight: 600; text-shadow: 0 2px 4px rgba(0,0,0,0.2);">
-                                📬 Nouveau Message de Contact
+                        <td style="background: linear-gradient(135deg, #dc2626 0%%, #991b1b 100%%); padding: 30px; text-align: center;">
+                            <h1 style="margin: 0; color: #ffffff; font-size: 28px; font-weight: bold;">
+                                📩 Nouveau Message
                             </h1>
                         </td>
                     </tr>
-                    
+
                     <!-- Content -->
                     <tr>
-                        <td style="padding: 40px;">
-                            <!-- Info Card -->
-                            <table width="100%%" cellpadding="0" cellspacing="0" style="background-color: #f8f9fa; border-left: 4px solid #dc2626; border-radius: 4px; padding: 20px; margin-bottom: 20px;">
+                        <td style="padding: 40px 30px;">
+                            <h2 style="margin: 0 0 20px 0; color: #1a1a1a; font-size: 20px;">
+                                Informations du contact
+                            </h2>
+                            
+                            <table role="presentation" width="100%%" cellspacing="0" cellpadding="10" style="margin-bottom: 20px;">
+                                <tr style="background-color: #f9fafb;">
+                                    <td style="padding: 12px; font-weight: bold; color: #374151; border-bottom: 1px solid #e5e7eb;">
+                                        Nom :
+                                    </td>
+                                    <td style="padding: 12px; color: #1a1a1a; border-bottom: 1px solid #e5e7eb;">
+                                        %s
+                                    </td>
+                                </tr>
                                 <tr>
-                                    <td>
-                                        <p style="margin: 0 0 12px 0; color: #374151; font-size: 14px;">
-                                            <strong style="color: #1f2937;">👤 Nom:</strong> %s
-                                        </p>
-                                        <p style="margin: 0 0 12px 0; color: #374151; font-size: 14px;">
-                                            <strong style="color: #1f2937;">📧 Email:</strong> 
-                                            <a href="mailto:%s" style="color: #dc2626; text-decoration: none;">%s</a>
-                                        </p>
-                                        <p style="margin: 0; color: #374151; font-size: 14px;">
-                                            <strong style="color: #1f2937;">📱 Téléphone:</strong> %s
-                                        </p>
+                                    <td style="padding: 12px; font-weight: bold; color: #374151; border-bottom: 1px solid #e5e7eb;">
+                                        Email :
+                                    </td>
+                                    <td style="padding: 12px; border-bottom: 1px solid #e5e7eb;">
+                                        <a href="mailto:%s" style="color: #dc2626; text-decoration: none;">%s</a>
+                                    </td>
+                                </tr>
+                                <tr style="background-color: #f9fafb;">
+                                    <td style="padding: 12px; font-weight: bold; color: #374151; border-bottom: 1px solid #e5e7eb;">
+                                        Téléphone :
+                                    </td>
+                                    <td style="padding: 12px; color: #1a1a1a; border-bottom: 1px solid #e5e7eb;">
+                                        %s
                                     </td>
                                 </tr>
                             </table>
 
-                            <!-- Message -->
-                            <div style="margin-top: 20px;">
-                                <h2 style="margin: 0 0 15px 0; color: #1f2937; font-size: 18px; font-weight: 600; border-bottom: 2px solid #e5e7eb; padding-bottom: 10px;">
-                                    💬 Message
-                                </h2>
-                                <div style="background-color: #f9fafb; border-radius: 6px; padding: 20px; color: #374151; font-size: 14px; line-height: 1.6; border: 1px solid #e5e7eb;">
-                                    %s
-                                </div>
+                            <h2 style="margin: 30px 0 15px 0; color: #1a1a1a; font-size: 20px;">
+                                Message
+                            </h2>
+                            <div style="background-color: #f9fafb; border-left: 4px solid #dc2626; padding: 20px; border-radius: 4px;">
+                                <p style="margin: 0; color: #1a1a1a; font-size: 16px; line-height: 1.6; white-space: pre-wrap;">%s</p>
                             </div>
                         </td>
                     </tr>
 
                     <!-- Footer -->
                     <tr>
-                        <td style="background-color: #1f2937; padding: 20px; text-align: center;">
-                            <p style="margin: 0; color: #9ca3af; font-size: 12px;">
-                                Message reçu le %s
+                        <td style="background-color: #1a1a1a; padding: 20px; text-align: center;">
+                            <p style="margin: 0; color: #ffffff; font-size: 14px;">
+                                <strong style="color: #dc2626;">Eldocam</strong> - Système de contact automatisé
+                            </p>
+                            <p style="margin: 5px 0 0 0; color: #999; font-size: 12px;">
+                                Envoyé le %s
                             </p>
                         </td>
                     </tr>
@@ -402,7 +419,7 @@ func sendEmail(form ContactForm, mailjetAPIKey, mailjetSecretKey, senderEmail, s
     </table>
 </body>
 </html>
-    `, escapedName, escapedEmail, escapedEmail, escapedTel, escapedMsgHTML, time.Now().Format("02/01/2006 à 15:04"))
+    `, escapedName, escapedEmail, escapedEmail, escapedTel, escapedMessage, time.Now().Format("02/01/2006 à 15:04"))
 
     adminMessage := mailjet.InfoMessagesV31{
         From: &mailjet.RecipientV31{
@@ -412,53 +429,39 @@ func sendEmail(form ContactForm, mailjetAPIKey, mailjetSecretKey, senderEmail, s
         To: &mailjet.RecipientsV31{
             mailjet.RecipientV31{
                 Email: adminTo,
-                Name:  "Admin",
             },
         },
-        Subject:  fmt.Sprintf("📬 Nouveau message de %s", form.Name),
-        TextPart: adminTextBody,
+        Subject:  adminSubject,
         HTMLPart: adminHTMLBody,
     }
 
-    // --- 2. Mail de confirmation au client (Design propre et moderne) ---
+    // Email de confirmation pour le client
     var confirmSubject, confirmTextBody, confirmHTMLBody string
 
     switch strings.ToLower(form.Language) {
-case "en":
-    confirmSubject = "Thank you for your message!"
-    confirmTextBody = fmt.Sprintf(
-        "Hello %s,\n\nThank you for contacting us. We have received your message and will get back to you as soon as possible.\n\nBest regards,\nThe Eldocam Team",
-        form.Name,
-    )
-    confirmHTMLBody = fmt.Sprintf(`
+    case "en":
+        confirmSubject = "✅ Message Received - Eldocam"
+        confirmTextBody = fmt.Sprintf("Hello %s,\n\nThank you for contacting us. We have received your message and will respond as soon as possible.\n\nBest regards,\nThe Eldocam Team", escapedName)
+        confirmHTMLBody = fmt.Sprintf(`
 <!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-</head>
-<body style="margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f5f5f5;">
-    <table width="100%%" cellpadding="0" cellspacing="0" style="background-color: #f5f5f5; padding: 40px 20px;">
+<html lang="en">
+<body style="margin: 0; padding: 0; font-family: Arial, sans-serif; background-color: #f4f4f4;">
+    <table role="presentation" width="100%%" cellspacing="0" cellpadding="0" style="background-color: #f4f4f4; padding: 20px 0;">
         <tr>
             <td align="center">
-                <table width="600" cellpadding="0" cellspacing="0" style="background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
-                    <!-- Header -->
+                <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
                     <tr>
-                        <td style="background: linear-gradient(135deg, #dc2626 0%%, #991b1b 100%%); padding: 40px; text-align: center;">
-                            <h1 style="margin: 0; color: #ffffff; font-size: 28px; font-weight: 600;">
-                                Thank you for your message!
-                            </h1>
+                        <td style="background: linear-gradient(135deg, #dc2626 0%%, #991b1b 100%%); padding: 30px; text-align: center;">
+                            <h1 style="margin: 0; color: #ffffff; font-size: 28px; font-weight: bold;">✅ Message Received</h1>
                         </td>
                     </tr>
-
-                    <!-- Content -->
                     <tr>
-                        <td style="padding: 40px;">
-                            <p style="margin: 0 0 20px 0; color: #1a1a1a; font-size: 16px; line-height: 1.6;">
+                        <td style="padding: 40px 30px;">
+                            <p style="margin: 0 0 15px 0; color: #1a1a1a; font-size: 18px;">
                                 Hello <strong style="color: #dc2626;">%s</strong>,
                             </p>
                             <p style="margin: 0 0 20px 0; color: #1a1a1a; font-size: 16px; line-height: 1.6;">
-                                Thank you for contacting us. We have received your message and will get back to you as soon as possible.
+                                Thank you for contacting us. We have received your message and will respond as soon as possible.
                             </p>
                             <p style="margin: 0; color: #1a1a1a; font-size: 16px; line-height: 1.6;">
                                 Best regards,<br>
@@ -466,8 +469,6 @@ case "en":
                             </p>
                         </td>
                     </tr>
-
-                    <!-- Footer -->
                     <tr>
                         <td style="background-color: #1a1a1a; padding: 20px; text-align: center;">
                             <p style="margin: 5px 0 0 0; color: #999; font-size: 12px;">
@@ -481,43 +482,31 @@ case "en":
     </table>
 </body>
 </html>
-    `, escapedName)
+        `, escapedName)
 
-case "nl":
-    confirmSubject = "Bedankt voor je bericht!"
-    confirmTextBody = fmt.Sprintf(
-        "Hallo %s,\n\nBedankt voor je bericht. We hebben het goed ontvangen en nemen zo snel mogelijk contact met je op.\n\nMet vriendelijke groet,\nHet Eldocam Team",
-        form.Name,
-    )
-    confirmHTMLBody = fmt.Sprintf(`
+    case "nl":
+        confirmSubject = "✅ Bericht Ontvangen - Eldocam"
+        confirmTextBody = fmt.Sprintf("Hallo %s,\n\nBedankt voor uw contact. We hebben uw bericht ontvangen en zullen zo snel mogelijk reageren.\n\nMet vriendelijke groet,\nHet Eldocam Team", escapedName)
+        confirmHTMLBody = fmt.Sprintf(`
 <!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0;">
-</head>
-<body style="margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f5f5f5;">
-    <table width="100%%" cellpadding="0" cellspacing="0" style="background-color: #f5f5f5; padding: 40px 20px;">
+<html lang="nl">
+<body style="margin: 0; padding: 0; font-family: Arial, sans-serif; background-color: #f4f4f4;">
+    <table role="presentation" width="100%%" cellspacing="0" cellpadding="0" style="background-color: #f4f4f4; padding: 20px 0;">
         <tr>
             <td align="center">
-                <table width="600" cellpadding="0" cellspacing="0" style="background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
-                    <!-- Header -->
+                <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
                     <tr>
-                        <td style="background: linear-gradient(135deg, #dc2626 0%%, #991b1b 100%%); padding: 40px; text-align: center;">
-                            <h1 style="margin: 0; color: #ffffff; font-size: 28px; font-weight: 600;">
-                                Bedankt voor je bericht!
-                            </h1>
+                        <td style="background: linear-gradient(135deg, #dc2626 0%%, #991b1b 100%%); padding: 30px; text-align: center;">
+                            <h1 style="margin: 0; color: #ffffff; font-size: 28px; font-weight: bold;">✅ Bericht Ontvangen</h1>
                         </td>
                     </tr>
-
-                    <!-- Content -->
                     <tr>
-                        <td style="padding: 40px;">
-                            <p style="margin: 0 0 20px 0; color: #1a1a1a; font-size: 16px; line-height: 1.6;">
+                        <td style="padding: 40px 30px;">
+                            <p style="margin: 0 0 15px 0; color: #1a1a1a; font-size: 18px;">
                                 Hallo <strong style="color: #dc2626;">%s</strong>,
                             </p>
                             <p style="margin: 0 0 20px 0; color: #1a1a1a; font-size: 16px; line-height: 1.6;">
-                                Bedankt voor je bericht. We hebben het goed ontvangen en nemen zo snel mogelijk contact met je op.
+                                Bedankt voor uw contact. We hebben uw bericht ontvangen en zullen zo snel mogelijk reageren.
                             </p>
                             <p style="margin: 0; color: #1a1a1a; font-size: 16px; line-height: 1.6;">
                                 Met vriendelijke groet,<br>
@@ -525,12 +514,10 @@ case "nl":
                             </p>
                         </td>
                     </tr>
-
-                    <!-- Footer -->
                     <tr>
                         <td style="background-color: #1a1a1a; padding: 20px; text-align: center;">
                             <p style="margin: 5px 0 0 0; color: #999; font-size: 12px;">
-                                Dit is een automatisch bericht, gelieve niet te antwoorden.
+                                Dit is een geautomatiseerd bericht, gelieve niet te antwoorden.
                             </p>
                         </td>
                     </tr>
@@ -540,39 +527,27 @@ case "nl":
     </table>
 </body>
 </html>
-    `, escapedName)
+        `, escapedName)
 
-default: // Français par défaut
-    confirmSubject = "Merci pour votre message !"
-    confirmTextBody = fmt.Sprintf(
-        "Bonjour %s,\n\nMerci de nous avoir contactés. Nous avons bien reçu votre message et nous vous répondrons dans les plus brefs délais.\n\nCordialement,\nL'équipe Eldocam",
-        form.Name,
-    )
-    confirmHTMLBody = fmt.Sprintf(`
+    default:
+        confirmSubject = "✅ Message Reçu - Eldocam"
+        confirmTextBody = fmt.Sprintf("Bonjour %s,\n\nMerci de nous avoir contactés. Nous avons bien reçu votre message et vous répondrons dans les plus brefs délais.\n\nCordialement,\nL'équipe Eldocam", escapedName)
+        confirmHTMLBody = fmt.Sprintf(`
 <!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0;">
-</head>
-<body style="margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f5f5f5;">
-    <table width="100%%" cellpadding="0" cellspacing="0" style="background-color: #f5f5f5; padding: 40px 20px;">
+<html lang="fr">
+<body style="margin: 0; padding: 0; font-family: Arial, sans-serif; background-color: #f4f4f4;">
+    <table role="presentation" width="100%%" cellspacing="0" cellpadding="0" style="background-color: #f4f4f4; padding: 20px 0;">
         <tr>
             <td align="center">
-                <table width="600" cellpadding="0" cellspacing="0" style="background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
-                    <!-- Header -->
+                <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
                     <tr>
-                        <td style="background: linear-gradient(135deg, #dc2626 0%%, #991b1b 100%%); padding: 40px; text-align: center;">
-                            <h1 style="margin: 0; color: #ffffff; font-size: 28px; font-weight: 600;">
-                                Merci pour votre message !
-                            </h1>
+                        <td style="background: linear-gradient(135deg, #dc2626 0%%, #991b1b 100%%); padding: 30px; text-align: center;">
+                            <h1 style="margin: 0; color: #ffffff; font-size: 28px; font-weight: bold;">✅ Message Reçu</h1>
                         </td>
                     </tr>
-
-                    <!-- Content -->
                     <tr>
-                        <td style="padding: 40px;">
-                            <p style="margin: 0 0 20px 0; color: #1a1a1a; font-size: 16px; line-height: 1.6;">
+                        <td style="padding: 40px 30px;">
+                            <p style="margin: 0 0 15px 0; color: #1a1a1a; font-size: 18px;">
                                 Bonjour <strong style="color: #dc2626;">%s</strong>,
                             </p>
                             <p style="margin: 0 0 20px 0; color: #1a1a1a; font-size: 16px; line-height: 1.6;">
@@ -584,8 +559,6 @@ default: // Français par défaut
                             </p>
                         </td>
                     </tr>
-
-                    <!-- Footer -->
                     <tr>
                         <td style="background-color: #1a1a1a; padding: 20px; text-align: center;">
                             <p style="margin: 5px 0 0 0; color: #999; font-size: 12px;">
@@ -599,8 +572,9 @@ default: // Français par défaut
     </table>
 </body>
 </html>
-    `, escapedName)
-}
+        `, escapedName)
+    }
+
     confirmMessage := mailjet.InfoMessagesV31{
         From: &mailjet.RecipientV31{
             Email: senderEmail,
@@ -617,7 +591,7 @@ default: // Français par défaut
         HTMLPart: confirmHTMLBody,
     }
 
-    // --- Envoi des deux emails ---
+    // Envoi des deux emails
     messages := mailjet.MessagesV31{
         Info: []mailjet.InfoMessagesV31{adminMessage, confirmMessage},
     }
@@ -627,7 +601,6 @@ default: // Français par défaut
         return "", fmt.Errorf("erreur Mailjet: %w", err)
     }
 
-    // Vérification du statut
     if len(res.ResultsV31) > 0 {
         firstResult := res.ResultsV31[0]
         if firstResult.Status != "success" {
@@ -648,7 +621,7 @@ default: // Français par défaut
 }
 
 func main() {
-    // Charger le fichier .env
+    // Charger le fichier .env (optionnel en production K8s)
     if err := godotenv.Load(); err != nil {
         log.Println("⚠️ Aucun fichier .env trouvé, utilisation des variables système")
     }
@@ -672,18 +645,26 @@ func main() {
 
     // Configuration CORS sécurisée
     corsHandler := cors.New(cors.Options{
-        AllowedOrigins:   []string{"https://eldocam.be", "http://localhost:3000"},
+        AllowedOrigins: []string{
+            "https://eldocam.com",
+            "https://eldocam.be",
+            "https://www.eldocam.com",
+            "https://www.eldocam.be",
+            "http://localhost:3000",
+        },
         AllowedMethods:   []string{"POST", "OPTIONS"},
         AllowedHeaders:   []string{"Content-Type", "X-Requested-With"},
         AllowCredentials: false,
         MaxAge:           3600,
     })
 
+    // Enregistrer les routes
+    http.HandleFunc("/health", healthHandler)
     http.Handle("/api/contact", corsHandler.Handler(http.HandlerFunc(contactHandler)))
 
     port := os.Getenv("PORT")
     if port == "" {
-        port = "3000"
+        port = "8000"
     }
 
     log.Printf("🚀 Serveur démarré sur le port %s", port)

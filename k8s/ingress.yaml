@@ -1,0 +1,37 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: eldocam-backend-ingress
+  namespace: eldocam
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - api.eldocam.com
+    - api.eldocam.be
+    secretName: eldocam-backend-tls
+  rules:
+  - host: api.eldocam.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: eldocam-backend
+            port:
+              number: 80
+  - host: api.eldocam.be
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: eldocam-backend
+            port:
+              number: 80

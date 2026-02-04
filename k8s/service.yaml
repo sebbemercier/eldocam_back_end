@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: eldocam-backend
+  namespace: eldocam
+spec:
+  selector:
+    app: eldocam-backend
+  ports:
+  - port: 80
+    targetPort: 8000
+  type: ClusterIP
