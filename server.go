@@ -1,343 +1,343 @@
 package main
 
 import (
-    "encoding/json"
-    "fmt"
-    "html"
-    "io"
-    "log"
-    "net/http"
-    "os"
-    "regexp"
-    "strings"
-    "sync"
-    "time"
+	"encoding/json"
+	"fmt"
+	"html"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
 
-    "github.com/joho/godotenv"
-    "github.com/mailjet/mailjet-apiv3-go/v4"
-    "github.com/rs/cors"
+	"github.com/joho/godotenv"
+	"github.com/mailjet/mailjet-apiv3-go/v4"
+	"github.com/rs/cors"
 )
 
 // --- Rate Limiting (protection anti-spam) ---
 var (
-    rateLimitMutex sync.Mutex
-    rateLimits     = make(map[string][]time.Time)
-    urlRegex       = regexp.MustCompile(`https?://[\w\.-]+(?:\.[\w\.-]+)+[\w\-\._~:/?#[\]@!\$&'\(\)\*\+,;=.]+`)
+	rateLimitMutex sync.Mutex
+	rateLimits     = make(map[string][]time.Time)
+	urlRegex       = regexp.MustCompile(`https?://[\w\.-]+(?:\.[\w\.-]+)+[\w\-\._~:/?#[\]@!\$&'\(\)\*\+,;=.]+`)
 )
 
 // Structure du formulaire avec validation
 type ContactForm struct {
-    Name     string `json:"name" validate:"required,min=2,max=80"`
-    Email    string `json:"email" validate:"required,email"`
-    Tel      string `json:"tel" validate:"max=40"`
-    Language string `json:"language"`
-    Message  string `json:"message" validate:"required,min=3,max=5000"`
+	Name     string `json:"name" validate:"required,min=2,max=80"`
+	Email    string `json:"email" validate:"required,email"`
+	Tel      string `json:"tel" validate:"max=40"`
+	Language string `json:"language"`
+	Message  string `json:"message" validate:"required,min=3,max=5000"`
 }
 
 // --- Health Check Handler (pour Kubernetes) ---
 func healthHandler(w http.ResponseWriter, r *http.Request) {
-    w.WriteHeader(http.StatusOK)
-    w.Header().Set("Content-Type", "application/json")
-    json.NewEncoder(w).Encode(map[string]string{
-        "status": "healthy",
-        "time":   time.Now().Format(time.RFC3339),
-    })
+	w.WriteHeader(http.StatusOK)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "healthy",
+		"time":   time.Now().Format(time.RFC3339),
+	})
 }
 
 // --- Fonction de rate limiting (max 3 requêtes par IP toutes les 10 min) ---
 func isRateLimited(ip string) bool {
-    rateLimitMutex.Lock()
-    defer rateLimitMutex.Unlock()
+	rateLimitMutex.Lock()
+	defer rateLimitMutex.Unlock()
 
-    now := time.Now()
-    windowStart := now.Add(-10 * time.Minute)
+	now := time.Now()
+	windowStart := now.Add(-10 * time.Minute)
 
-    // Nettoyer les anciennes entrées
-    var validTimes []time.Time
-    for _, t := range rateLimits[ip] {
-        if t.After(windowStart) {
-            validTimes = append(validTimes, t)
-        }
-    }
-    rateLimits[ip] = validTimes
+	// Nettoyer les anciennes entrées
+	var validTimes []time.Time
+	for _, t := range rateLimits[ip] {
+		if t.After(windowStart) {
+			validTimes = append(validTimes, t)
+		}
+	}
+	rateLimits[ip] = validTimes
 
-    // Vérifier la limite
-    if len(rateLimits[ip]) >= 3 {
-        log.Printf("⚠️ Rate limit dépassé pour %s (%d requêtes)", ip, len(rateLimits[ip]))
-        return true
-    }
+	// Vérifier la limite
+	if len(rateLimits[ip]) >= 3 {
+		log.Printf("⚠️ Rate limit dépassé pour %s (%d requêtes)", ip, len(rateLimits[ip]))
+		return true
+	}
 
-    // Ajouter la nouvelle requête
-    rateLimits[ip] = append(rateLimits[ip], now)
-    return false
+	// Ajouter la nouvelle requête
+	rateLimits[ip] = append(rateLimits[ip], now)
+	return false
 }
 
 // --- Détection de spam basique ---
 func containsSpam(message string) bool {
-    lowerMsg := strings.ToLower(message)
+	lowerMsg := strings.ToLower(message)
 
-    // Détection d'URLs (potentiellement du spam)
-    if urlRegex.MatchString(message) {
-        log.Println("⚠️ URL détectée dans le message")
-        return true
-    }
+	// Détection d'URLs (potentiellement du spam)
+	if urlRegex.MatchString(message) {
+		log.Println("⚠️ URL détectée dans le message")
+		return true
+	}
 
-    // Mots-clés spam courants
-    spamKeywords := []string{
-        "viagra", "casino", "lottery", "prize", "click here",
-        "buy now", "limited offer", "crypto", "investment",
-        "bitcoin", "free money", "earn money", "work from home",
-    }
+	// Mots-clés spam courants
+	spamKeywords := []string{
+		"viagra", "casino", "lottery", "prize", "click here",
+		"buy now", "limited offer", "crypto", "investment",
+		"bitcoin", "free money", "earn money", "work from home",
+	}
 
-    for _, keyword := range spamKeywords {
-        if strings.Contains(lowerMsg, keyword) {
-            log.Printf("⚠️ Mot-clé spam détecté: %s", keyword)
-            return true
-        }
-    }
+	for _, keyword := range spamKeywords {
+		if strings.Contains(lowerMsg, keyword) {
+			log.Printf("⚠️ Mot-clé spam détecté: %s", keyword)
+			return true
+		}
+	}
 
-    return false
+	return false
 }
 
 // --- Validation email robuste ---
 func isValidEmail(email string) bool {
-    // Regex email standard RFC 5322
-    emailRegex := regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`)
+	// Regex email standard RFC 5322
+	emailRegex := regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`)
 
-    if !emailRegex.MatchString(email) {
-        return false
-    }
+	if !emailRegex.MatchString(email) {
+		return false
+	}
 
-    // Bloquer les domaines jetables courants
-    disposableDomains := []string{
-        "tempmail.com", "guerrillamail.com", "10minutemail.com",
-        "mailinator.com", "throwaway.email", "yopmail.com",
-    }
+	// Bloquer les domaines jetables courants
+	disposableDomains := []string{
+		"tempmail.com", "guerrillamail.com", "10minutemail.com",
+		"mailinator.com", "throwaway.email", "yopmail.com",
+	}
 
-    emailLower := strings.ToLower(email)
-    for _, domain := range disposableDomains {
-        if strings.HasSuffix(emailLower, "@"+domain) {
-            log.Printf("⚠️ Email jetable détecté: %s", email)
-            return false
-        }
-    }
+	emailLower := strings.ToLower(email)
+	for _, domain := range disposableDomains {
+		if strings.HasSuffix(emailLower, "@"+domain) {
+			log.Printf("⚠️ Email jetable détecté: %s", email)
+			return false
+		}
+	}
 
-    return true
+	return true
 }
 
 // --- Vérification Cloudflare Turnstile ---
 func verifyTurnstile(token, ip string) bool {
-    secret := os.Getenv("TURNSTILE_SECRET")
-    if secret == "" {
-        log.Println("❌ TURNSTILE_SECRET non configuré")
-        return false
-    }
+	secret := os.Getenv("TURNSTILE_SECRET")
+	if secret == "" {
+		log.Println("❌ TURNSTILE_SECRET non configuré")
+		return false
+	}
 
-    payload := fmt.Sprintf(`{"secret":"%s","response":"%s","remoteip":"%s"}`, secret, token, ip)
-    resp, err := http.Post(
-        "https://challenges.cloudflare.com/turnstile/v0/siteverify",
-        "application/json",
-        strings.NewReader(payload),
-    )
-    if err != nil {
-        log.Println("❌ Erreur requête Turnstile:", err)
-        return false
-    }
-    defer resp.Body.Close()
+	payload := fmt.Sprintf(`{"secret":"%s","response":"%s","remoteip":"%s"}`, secret, token, ip)
+	resp, err := http.Post(
+		"https://challenges.cloudflare.com/turnstile/v0/siteverify",
+		"application/json",
+		strings.NewReader(payload),
+	)
+	if err != nil {
+		log.Println("❌ Erreur requête Turnstile:", err)
+		return false
+	}
+	defer resp.Body.Close()
 
-    body, _ := io.ReadAll(resp.Body)
-    var result map[string]interface{}
-    if err := json.Unmarshal(body, &result); err != nil {
-        log.Println("❌ Erreur parsing Turnstile:", err)
-        return false
-    }
+	body, _ := io.ReadAll(resp.Body)
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		log.Println("❌ Erreur parsing Turnstile:", err)
+		return false
+	}
 
-    success, ok := result["success"].(bool)
-    if !ok || !success {
-        log.Println("❌ Vérification Turnstile échouée:", result)
-    }
-    return ok && success
+	success, ok := result["success"].(bool)
+	if !ok || !success {
+		log.Println("❌ Vérification Turnstile échouée:", result)
+	}
+	return ok && success
 }
 
 // --- Handler pour le formulaire de contact ---
 func contactHandler(w http.ResponseWriter, r *http.Request) {
-    if r.Method != http.MethodPost {
-        http.Error(w, "Méthode non autorisée", http.StatusMethodNotAllowed)
-        return
-    }
+	if r.Method != http.MethodPost {
+		http.Error(w, "Méthode non autorisée", http.StatusMethodNotAllowed)
+		return
+	}
 
-    // Récupération de l'IP réelle
-    ip := r.Header.Get("X-Forwarded-For")
-    if ip == "" {
-        ip = r.Header.Get("X-Real-IP")
-    }
-    if ip == "" {
-        ip = strings.Split(r.RemoteAddr, ":")[0]
-    }
+	// Récupération de l'IP réelle
+	ip := r.Header.Get("X-Forwarded-For")
+	if ip == "" {
+		ip = r.Header.Get("X-Real-IP")
+	}
+	if ip == "" {
+		ip = strings.Split(r.RemoteAddr, ":")[0]
+	}
 
-    log.Printf("📩 Nouvelle requête de contact depuis %s", ip)
+	log.Printf("📩 Nouvelle requête de contact depuis %s", ip)
 
-    // 🔒 Rate limiting
-    if isRateLimited(ip) {
-        log.Printf("🚫 Trop de requêtes depuis %s", ip)
-        http.Error(w, "Trop de requêtes. Veuillez réessayer plus tard.", http.StatusTooManyRequests)
-        return
-    }
+	// 🔒 Rate limiting
+	if isRateLimited(ip) {
+		log.Printf("🚫 Trop de requêtes depuis %s", ip)
+		http.Error(w, "Trop de requêtes. Veuillez réessayer plus tard.", http.StatusTooManyRequests)
+		return
+	}
 
-    // Détecter le Content-Type
-    contentType := r.Header.Get("Content-Type")
-    log.Printf("📋 Content-Type: %s", contentType)
+	// Détecter le Content-Type
+	contentType := r.Header.Get("Content-Type")
+	log.Printf("📋 Content-Type: %s", contentType)
 
-    var form ContactForm
-    var turnstileToken string
+	var form ContactForm
+	var turnstileToken string
 
-    if strings.Contains(contentType, "application/json") {
-        // Format JSON
-        body, err := io.ReadAll(r.Body)
-        if err != nil {
-            log.Println("❌ Erreur lecture body:", err)
-            http.Error(w, "Erreur de lecture des données", http.StatusBadRequest)
-            return
-        }
-        defer r.Body.Close()
+	if strings.Contains(contentType, "application/json") {
+		// Format JSON
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			log.Println("❌ Erreur lecture body:", err)
+			http.Error(w, "Erreur de lecture des données", http.StatusBadRequest)
+			return
+		}
+		defer r.Body.Close()
 
-        type RequestWithToken struct {
-            Name           string `json:"name"`
-            Email          string `json:"email"`
-            Tel            string `json:"tel"`
-            Language       string `json:"language"`
-            Message        string `json:"message"`
-            TurnstileToken string `json:"cf-turnstile-response"`
-        }
+		type RequestWithToken struct {
+			Name           string `json:"name"`
+			Email          string `json:"email"`
+			Tel            string `json:"tel"`
+			Language       string `json:"language"`
+			Message        string `json:"message"`
+			TurnstileToken string `json:"cf-turnstile-response"`
+		}
 
-        var requestData RequestWithToken
-        if err := json.Unmarshal(body, &requestData); err != nil {
-            log.Println("❌ Erreur décodage JSON:", err)
-            http.Error(w, "Données JSON invalides", http.StatusBadRequest)
-            return
-        }
+		var requestData RequestWithToken
+		if err := json.Unmarshal(body, &requestData); err != nil {
+			log.Println("❌ Erreur décodage JSON:", err)
+			http.Error(w, "Données JSON invalides", http.StatusBadRequest)
+			return
+		}
 
-        form = ContactForm{
-            Name:     requestData.Name,
-            Email:    requestData.Email,
-            Tel:      requestData.Tel,
-            Language: requestData.Language,
-            Message:  requestData.Message,
-        }
-        turnstileToken = requestData.TurnstileToken
+		form = ContactForm{
+			Name:     requestData.Name,
+			Email:    requestData.Email,
+			Tel:      requestData.Tel,
+			Language: requestData.Language,
+			Message:  requestData.Message,
+		}
+		turnstileToken = requestData.TurnstileToken
 
-    } else {
-        // Format application/x-www-form-urlencoded
-        if err := r.ParseForm(); err != nil {
-            log.Println("❌ Erreur parsing formulaire:", err)
-            http.Error(w, "Erreur de parsing", http.StatusBadRequest)
-            return
-        }
+	} else {
+		// Format application/x-www-form-urlencoded
+		if err := r.ParseForm(); err != nil {
+			log.Println("❌ Erreur parsing formulaire:", err)
+			http.Error(w, "Erreur de parsing", http.StatusBadRequest)
+			return
+		}
 
-        form = ContactForm{
-            Name:     r.FormValue("name"),
-            Email:    r.FormValue("email"),
-            Tel:      r.FormValue("tel"),
-            Language: r.FormValue("language"),
-            Message:  r.FormValue("message"),
-        }
-        turnstileToken = r.FormValue("cf-turnstile-response")
-    }
+		form = ContactForm{
+			Name:     r.FormValue("name"),
+			Email:    r.FormValue("email"),
+			Tel:      r.FormValue("tel"),
+			Language: r.FormValue("language"),
+			Message:  r.FormValue("message"),
+		}
+		turnstileToken = r.FormValue("cf-turnstile-response")
+	}
 
-    // 🔒 Vérification Turnstile OBLIGATOIRE
-    if turnstileToken == "" {
-        log.Println("❌ Token Turnstile manquant")
-        http.Error(w, "Vérification de sécurité manquante.", http.StatusBadRequest)
-        return
-    }
+	// 🔒 Vérification Turnstile OBLIGATOIRE
+	if turnstileToken == "" {
+		log.Println("❌ Token Turnstile manquant")
+		http.Error(w, "Vérification de sécurité manquante.", http.StatusBadRequest)
+		return
+	}
 
-    if !verifyTurnstile(turnstileToken, ip) {
-        log.Println("❌ Vérification Turnstile échouée")
-        http.Error(w, "Vérification de sécurité échouée.", http.StatusBadRequest)
-        return
-    }
+	if !verifyTurnstile(turnstileToken, ip) {
+		log.Println("❌ Vérification Turnstile échouée")
+		http.Error(w, "Vérification de sécurité échouée.", http.StatusBadRequest)
+		return
+	}
 
-    log.Println("✅ Vérification Turnstile réussie")
+	log.Println("✅ Vérification Turnstile réussie")
 
-    // Nettoyage et validation des champs
-    form.Name = strings.TrimSpace(form.Name)
-    form.Email = strings.TrimSpace(strings.ToLower(form.Email))
-    form.Tel = strings.TrimSpace(form.Tel)
-    form.Message = strings.TrimSpace(form.Message)
+	// Nettoyage et validation des champs
+	form.Name = strings.TrimSpace(form.Name)
+	form.Email = strings.TrimSpace(strings.ToLower(form.Email))
+	form.Tel = strings.TrimSpace(form.Tel)
+	form.Message = strings.TrimSpace(form.Message)
 
-    if form.Name == "" || len(form.Name) < 2 || len(form.Name) > 80 {
-        log.Println("❌ Nom invalide")
-        http.Error(w, "Le nom doit contenir entre 2 et 80 caractères", http.StatusBadRequest)
-        return
-    }
+	if form.Name == "" || len(form.Name) < 2 || len(form.Name) > 80 {
+		log.Println("❌ Nom invalide")
+		http.Error(w, "Le nom doit contenir entre 2 et 80 caractères", http.StatusBadRequest)
+		return
+	}
 
-    if !isValidEmail(form.Email) {
-        log.Println("❌ Email invalide:", form.Email)
-        http.Error(w, "Email invalide", http.StatusBadRequest)
-        return
-    }
+	if !isValidEmail(form.Email) {
+		log.Println("❌ Email invalide:", form.Email)
+		http.Error(w, "Email invalide", http.StatusBadRequest)
+		return
+	}
 
-    if len(form.Tel) > 40 {
-        log.Println("❌ Téléphone trop long")
-        http.Error(w, "Numéro de téléphone trop long", http.StatusBadRequest)
-        return
-    }
+	if len(form.Tel) > 40 {
+		log.Println("❌ Téléphone trop long")
+		http.Error(w, "Numéro de téléphone trop long", http.StatusBadRequest)
+		return
+	}
 
-    if form.Message == "" || len(form.Message) < 3 || len(form.Message) > 5000 {
-        log.Println("❌ Message invalide (longueur)")
-        http.Error(w, "Le message doit contenir entre 3 et 5000 caractères", http.StatusBadRequest)
-        return
-    }
+	if form.Message == "" || len(form.Message) < 3 || len(form.Message) > 5000 {
+		log.Println("❌ Message invalide (longueur)")
+		http.Error(w, "Le message doit contenir entre 3 et 5000 caractères", http.StatusBadRequest)
+		return
+	}
 
-    // 🔒 Détection de spam
-    if containsSpam(form.Message) {
-        log.Printf("🚫 Spam détecté depuis %s", ip)
-        http.Error(w, "Message non autorisé", http.StatusForbidden)
-        return
-    }
+	// 🔒 Détection de spam
+	if containsSpam(form.Message) {
+		log.Printf("🚫 Spam détecté depuis %s", ip)
+		http.Error(w, "Message non autorisé", http.StatusForbidden)
+		return
+	}
 
-    log.Printf("✅ Formulaire valide de %s (%s)", form.Name, form.Email)
+	log.Printf("✅ Formulaire valide de %s (%s)", form.Name, form.Email)
 
-    // Envoi de l'email
-    mailjetAPIKey := os.Getenv("MAILJET_API_KEY")
-    mailjetSecretKey := os.Getenv("MAILJET_SECRET_KEY")
-    senderEmail := os.Getenv("SENDER_EMAIL")
-    senderName := os.Getenv("SENDER_NAME")
-    adminTo := os.Getenv("ADMIN_TO")
+	// Envoi de l'email
+	mailjetAPIKey := os.Getenv("MAILJET_API_KEY")
+	mailjetSecretKey := os.Getenv("MAILJET_SECRET_KEY")
+	senderEmail := os.Getenv("SENDER_EMAIL")
+	senderName := os.Getenv("SENDER_NAME")
+	adminTo := os.Getenv("ADMIN_TO")
 
-    if mailjetAPIKey == "" || mailjetSecretKey == "" || senderEmail == "" || adminTo == "" {
-        log.Println("❌ Variables d'environnement manquantes")
-        http.Error(w, "Configuration serveur incomplète", http.StatusInternalServerError)
-        return
-    }
+	if mailjetAPIKey == "" || mailjetSecretKey == "" || senderEmail == "" || adminTo == "" {
+		log.Println("❌ Variables d'environnement manquantes")
+		http.Error(w, "Configuration serveur incomplète", http.StatusInternalServerError)
+		return
+	}
 
-    successMsg, err := sendEmail(form, mailjetAPIKey, mailjetSecretKey, senderEmail, senderName, adminTo)
-    if err != nil {
-        log.Println("❌ Erreur lors de l'envoi:", err)
-        http.Error(w, "Erreur lors de l'envoi du message", http.StatusInternalServerError)
-        return
-    }
+	successMsg, err := sendEmail(form, mailjetAPIKey, mailjetSecretKey, senderEmail, senderName, adminTo)
+	if err != nil {
+		log.Println("❌ Erreur lors de l'envoi:", err)
+		http.Error(w, "Erreur lors de l'envoi du message", http.StatusInternalServerError)
+		return
+	}
 
-    // Réponse JSON avec message traduit
-    w.Header().Set("Content-Type", "application/json")
-    json.NewEncoder(w).Encode(map[string]string{
-        "message": successMsg,
-    })
+	// Réponse JSON avec message traduit
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"message": successMsg,
+	})
 }
 
 // --- Envoi d'email via Mailjet ---
 func sendEmail(form ContactForm, mailjetAPIKey, mailjetSecretKey, senderEmail, senderName, adminTo string) (string, error) {
-    mailjetClient := mailjet.NewMailjetClient(mailjetAPIKey, mailjetSecretKey)
+	mailjetClient := mailjet.NewMailjetClient(mailjetAPIKey, mailjetSecretKey)
 
-    // Échapper les caractères HTML
-    escapedName := html.EscapeString(form.Name)
-    escapedEmail := html.EscapeString(form.Email)
-    escapedTel := html.EscapeString(form.Tel)
-    escapedMessage := html.EscapeString(form.Message)
+	// Échapper les caractères HTML
+	escapedName := html.EscapeString(form.Name)
+	escapedEmail := html.EscapeString(form.Email)
+	escapedTel := html.EscapeString(form.Tel)
+	escapedMessage := html.EscapeString(form.Message)
 
-    // Email pour l'admin
-    adminSubject := fmt.Sprintf("📩 Nouveau message de %s", escapedName)
-    adminHTMLBody := fmt.Sprintf(`
+	// Email pour l'admin
+	adminSubject := fmt.Sprintf("📩 Nouveau message de %s", escapedName)
+	adminHTMLBody := fmt.Sprintf(`
 <!DOCTYPE html>
 <html lang="fr">
 <head>
@@ -421,28 +421,28 @@ func sendEmail(form ContactForm, mailjetAPIKey, mailjetSecretKey, senderEmail, s
 </html>
     `, escapedName, escapedEmail, escapedEmail, escapedTel, escapedMessage, time.Now().Format("02/01/2006 à 15:04"))
 
-    adminMessage := mailjet.InfoMessagesV31{
-        From: &mailjet.RecipientV31{
-            Email: senderEmail,
-            Name:  senderName,
-        },
-        To: &mailjet.RecipientsV31{
-            mailjet.RecipientV31{
-                Email: adminTo,
-            },
-        },
-        Subject:  adminSubject,
-        HTMLPart: adminHTMLBody,
-    }
+	adminMessage := mailjet.InfoMessagesV31{
+		From: &mailjet.RecipientV31{
+			Email: senderEmail,
+			Name:  senderName,
+		},
+		To: &mailjet.RecipientsV31{
+			mailjet.RecipientV31{
+				Email: adminTo,
+			},
+		},
+		Subject:  adminSubject,
+		HTMLPart: adminHTMLBody,
+	}
 
-    // Email de confirmation pour le client
-    var confirmSubject, confirmTextBody, confirmHTMLBody string
+	// Email de confirmation pour le client
+	var confirmSubject, confirmTextBody, confirmHTMLBody string
 
-    switch strings.ToLower(form.Language) {
-    case "en":
-        confirmSubject = "✅ Message Received - Eldocam"
-        confirmTextBody = fmt.Sprintf("Hello %s,\n\nThank you for contacting us. We have received your message and will respond as soon as possible.\n\nBest regards,\nThe Eldocam Team", escapedName)
-        confirmHTMLBody = fmt.Sprintf(`
+	switch strings.ToLower(form.Language) {
+	case "en":
+		confirmSubject = "✅ Message Received - Eldocam"
+		confirmTextBody = fmt.Sprintf("Hello %s,\n\nThank you for contacting us. We have received your message and will respond as soon as possible.\n\nBest regards,\nThe Eldocam Team", escapedName)
+		confirmHTMLBody = fmt.Sprintf(`
 <!DOCTYPE html>
 <html lang="en">
 <body style="margin: 0; padding: 0; font-family: Arial, sans-serif; background-color: #f4f4f4;">
@@ -484,10 +484,10 @@ func sendEmail(form ContactForm, mailjetAPIKey, mailjetSecretKey, senderEmail, s
 </html>
         `, escapedName)
 
-    case "nl":
-        confirmSubject = "✅ Bericht Ontvangen - Eldocam"
-        confirmTextBody = fmt.Sprintf("Hallo %s,\n\nBedankt voor uw contact. We hebben uw bericht ontvangen en zullen zo snel mogelijk reageren.\n\nMet vriendelijke groet,\nHet Eldocam Team", escapedName)
-        confirmHTMLBody = fmt.Sprintf(`
+	case "nl":
+		confirmSubject = "✅ Bericht Ontvangen - Eldocam"
+		confirmTextBody = fmt.Sprintf("Hallo %s,\n\nBedankt voor uw contact. We hebben uw bericht ontvangen en zullen zo snel mogelijk reageren.\n\nMet vriendelijke groet,\nHet Eldocam Team", escapedName)
+		confirmHTMLBody = fmt.Sprintf(`
 <!DOCTYPE html>
 <html lang="nl">
 <body style="margin: 0; padding: 0; font-family: Arial, sans-serif; background-color: #f4f4f4;">
@@ -529,10 +529,10 @@ func sendEmail(form ContactForm, mailjetAPIKey, mailjetSecretKey, senderEmail, s
 </html>
         `, escapedName)
 
-    default:
-        confirmSubject = "✅ Message Reçu - Eldocam"
-        confirmTextBody = fmt.Sprintf("Bonjour %s,\n\nMerci de nous avoir contactés. Nous avons bien reçu votre message et vous répondrons dans les plus brefs délais.\n\nCordialement,\nL'équipe Eldocam", escapedName)
-        confirmHTMLBody = fmt.Sprintf(`
+	default:
+		confirmSubject = "✅ Message Reçu - Eldocam"
+		confirmTextBody = fmt.Sprintf("Bonjour %s,\n\nMerci de nous avoir contactés. Nous avons bien reçu votre message et vous répondrons dans les plus brefs délais.\n\nCordialement,\nL'équipe Eldocam", escapedName)
+		confirmHTMLBody = fmt.Sprintf(`
 <!DOCTYPE html>
 <html lang="fr">
 <body style="margin: 0; padding: 0; font-family: Arial, sans-serif; background-color: #f4f4f4;">
@@ -573,106 +573,106 @@ func sendEmail(form ContactForm, mailjetAPIKey, mailjetSecretKey, senderEmail, s
 </body>
 </html>
         `, escapedName)
-    }
+	}
 
-    confirmMessage := mailjet.InfoMessagesV31{
-        From: &mailjet.RecipientV31{
-            Email: senderEmail,
-            Name:  senderName,
-        },
-        To: &mailjet.RecipientsV31{
-            mailjet.RecipientV31{
-                Email: form.Email,
-                Name:  form.Name,
-            },
-        },
-        Subject:  confirmSubject,
-        TextPart: confirmTextBody,
-        HTMLPart: confirmHTMLBody,
-    }
+	confirmMessage := mailjet.InfoMessagesV31{
+		From: &mailjet.RecipientV31{
+			Email: senderEmail,
+			Name:  senderName,
+		},
+		To: &mailjet.RecipientsV31{
+			mailjet.RecipientV31{
+				Email: form.Email,
+				Name:  form.Name,
+			},
+		},
+		Subject:  confirmSubject,
+		TextPart: confirmTextBody,
+		HTMLPart: confirmHTMLBody,
+	}
 
-    // Envoi des deux emails
-    messages := mailjet.MessagesV31{
-        Info: []mailjet.InfoMessagesV31{adminMessage, confirmMessage},
-    }
+	// Envoi des deux emails
+	messages := mailjet.MessagesV31{
+		Info: []mailjet.InfoMessagesV31{adminMessage, confirmMessage},
+	}
 
-    res, err := mailjetClient.SendMailV31(&messages)
-    if err != nil {
-        return "", fmt.Errorf("erreur Mailjet: %w", err)
-    }
+	res, err := mailjetClient.SendMailV31(&messages)
+	if err != nil {
+		return "", fmt.Errorf("erreur Mailjet: %w", err)
+	}
 
-    if len(res.ResultsV31) > 0 {
-        firstResult := res.ResultsV31[0]
-        if firstResult.Status != "success" {
-            return "", fmt.Errorf("échec envoi email: statut=%s", firstResult.Status)
-        }
-    }
+	if len(res.ResultsV31) > 0 {
+		firstResult := res.ResultsV31[0]
+		if firstResult.Status != "success" {
+			return "", fmt.Errorf("échec envoi email: statut=%s", firstResult.Status)
+		}
+	}
 
-    log.Printf("✅ Emails envoyés avec succès à %s et %s", adminTo, form.Email)
+	log.Printf("✅ Emails envoyés avec succès à %s et %s", adminTo, form.Email)
 
-    switch strings.ToLower(form.Language) {
-    case "en":
-        return "Message sent successfully!", nil
-    case "nl":
-        return "Bericht succesvol verzonden!", nil
-    default:
-        return "Message envoyé avec succès !", nil
-    }
+	switch strings.ToLower(form.Language) {
+	case "en":
+		return "Message sent successfully!", nil
+	case "nl":
+		return "Bericht succesvol verzonden!", nil
+	default:
+		return "Message envoyé avec succès !", nil
+	}
 }
 
 func main() {
-    // Charger le fichier .env (optionnel en production K8s)
-    if err := godotenv.Load(); err != nil {
-        log.Println("⚠️ Aucun fichier .env trouvé, utilisation des variables système")
-    }
+	// Charger le fichier .env (optionnel en production K8s)
+	if err := godotenv.Load(); err != nil {
+		log.Println("⚠️ Aucun fichier .env trouvé, utilisation des variables système")
+	}
 
-    // Vérifier les variables d'environnement critiques
-    requiredVars := []string{
-        "MAILJET_API_KEY",
-        "MAILJET_SECRET_KEY",
-        "SENDER_EMAIL",
-        "ADMIN_TO",
-        "TURNSTILE_SECRET",
-    }
+	// Vérifier les variables d'environnement critiques
+	requiredVars := []string{
+		"MAILJET_API_KEY",
+		"MAILJET_SECRET_KEY",
+		"SENDER_EMAIL",
+		"ADMIN_TO",
+		"TURNSTILE_SECRET",
+	}
 
-    for _, v := range requiredVars {
-        if os.Getenv(v) == "" {
-            log.Fatalf("❌ Variable d'environnement manquante: %s", v)
-        }
-    }
+	for _, v := range requiredVars {
+		if os.Getenv(v) == "" {
+			log.Fatalf("❌ Variable d'environnement manquante: %s", v)
+		}
+	}
 
-    log.Println("✅ Configuration chargée avec succès")
+	log.Println("✅ Configuration chargée avec succès")
 
-    // Configuration CORS sécurisée
-    corsHandler := cors.New(cors.Options{
-        AllowedOrigins: []string{
-            "https://eldocam.com",
-            "https://eldocam.be",
-            "https://www.eldocam.com",
-            "https://www.eldocam.be",
-            "http://localhost:3000",
-        },
-        AllowedMethods:   []string{"POST", "OPTIONS"},
-        AllowedHeaders:   []string{"Content-Type", "X-Requested-With"},
-        AllowCredentials: false,
-        MaxAge:           3600,
-    })
+	// Configuration CORS sécurisée
+	corsHandler := cors.New(cors.Options{
+		AllowedOrigins: []string{
+			"https://eldocam.com",
+			"https://eldocam.be",
+			"https://www.eldocam.com",
+			"https://www.eldocam.be",
+			"http://localhost:3000",
+		},
+		AllowedMethods:   []string{"POST", "OPTIONS"},
+		AllowedHeaders:   []string{"Content-Type", "X-Requested-With"},
+		AllowCredentials: false,
+		MaxAge:           3600,
+	})
 
-    // Enregistrer les routes
-    http.HandleFunc("/health", healthHandler)
-    http.Handle("/api/contact", corsHandler.Handler(http.HandlerFunc(contactHandler)))
+	// Enregistrer les routes
+	http.HandleFunc("/health", healthHandler)
+	http.Handle("/", corsHandler.Handler(http.HandlerFunc(contactHandler)))
 
-    port := os.Getenv("PORT")
-    if port == "" {
-        port = "8000"
-    }
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8000"
+	}
 
-    log.Printf("🚀 Serveur démarré sur le port %s", port)
-    log.Printf("🔒 Rate limiting: 3 requêtes max par IP / 10 minutes")
-    log.Printf("🛡️ Cloudflare Turnstile: Activé")
-    log.Printf("🚫 Détection de spam: Activée")
+	log.Printf("🚀 Serveur démarré sur le port %s", port)
+	log.Printf("🔒 Rate limiting: 3 requêtes max par IP / 10 minutes")
+	log.Printf("🛡️ Cloudflare Turnstile: Activé")
+	log.Printf("🚫 Détection de spam: Activée")
 
-    if err := http.ListenAndServe(":"+port, nil); err != nil {
-        log.Fatal("❌ Erreur serveur:", err)
-    }
+	if err := http.ListenAndServe(":"+port, nil); err != nil {
+		log.Fatal("❌ Erreur serveur:", err)
+	}
 }
