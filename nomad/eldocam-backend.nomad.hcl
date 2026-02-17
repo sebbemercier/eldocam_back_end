@@ -54,9 +54,20 @@ job "eldocam-backend" {
     task "server" {
       driver = "docker"
 
-      # Configuration Vault
+      # Vault integration avec Workload Identity (Nomad 1.11+)
       vault {
-        policies = ["eldocam-backend"]
+        policies      = ["eldocam-backend"]
+        change_mode   = "restart"
+        change_signal = "SIGTERM"
+      }
+
+      # Workload Identity for Vault
+      identity {
+        name = "vault_default"
+        aud  = ["vault.io"]
+        ttl  = "1h"
+        env  = false
+        file = false
       }
 
       config {

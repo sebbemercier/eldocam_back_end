@@ -4,8 +4,22 @@ version: 2.1
 # Nécessite les contextes :
 # - github-creds : DOCKER_LOGIN, DOCKER_PASSWORD
 # - nomad-creds : NOMAD_ADDR, NOMAD_TOKEN
+# - vault-creds : VAULT_TOKEN (pour mise à jour secrets)
 
 jobs:
+  # Job optionnel pour mettre à jour les secrets Vault
+  update-vault-secrets:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - run:
+          name: Update Vault secrets
+          command: |
+            chmod +x scripts/manage-vault-secrets.sh
+            # Les secrets viennent du context vault-secrets
+            ./scripts/manage-vault-secrets.sh update
+
   build-and-push:
     docker:
       - image: cimg/base:stable
@@ -46,6 +60,8 @@ jobs:
 
 workflows:
   version: 2
+  
+  # Workflow principal : build + deploy
   build-deploy:
     jobs:
       - build-and-push:
@@ -59,3 +75,14 @@ workflows:
           filters:
             branches:
               only: main
+  
+  # Workflow manuel pour mettre à jour les secrets Vault
+  # Lancer via CircleCI UI avec le bouton "Trigger Pipeline"
+  update-secrets:
+    when:
+      equal: [ secrets, << pipeline.trigger_source >> ]
+    jobs:
+      - update-vault-secrets:
+          context:
+            - vault-creds
+            - vault-secrets
