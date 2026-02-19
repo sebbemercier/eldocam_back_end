@@ -17,7 +17,6 @@ API backend en Go pour gérer les formulaires de contact Eldocam avec validation
 
 - **API Backend**: https://api.eldocam.com
 - **Frontend**: https://eldocam.com
-- **Nomad UI**: https://nomad.eldocam.com
 - **Health Check**: https://api.eldocam.com/health
 
 ## ✨ Fonctionnalités
