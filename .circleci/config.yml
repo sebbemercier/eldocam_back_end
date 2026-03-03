@@ -55,8 +55,8 @@ jobs:
           name: Deploy to Nomad
           command: |
             export IMAGE_TAG="<< pipeline.number >>-${CIRCLE_SHA1:0:7}"
-            nomad job validate -var image_tag=${IMAGE_TAG} nomad/eldocam-backend.nomad.hcl
-            nomad job run -var image_tag=${IMAGE_TAG} nomad/eldocam-backend.nomad.hcl
+            nomad job validate -var image_tag=${IMAGE_TAG} -var vault_token=${VAULT_TOKEN} nomad/eldocam-backend.nomad.hcl
+            nomad job run -var image_tag=${IMAGE_TAG} -var vault_token=${VAULT_TOKEN} nomad/eldocam-backend.nomad.hcl
 
 workflows:
   version: 2
@@ -72,6 +72,7 @@ workflows:
             - build-and-push
           context:
             - nomad-creds
+            - vault-creds
           filters:
             branches:
               only: main

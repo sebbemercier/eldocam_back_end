@@ -65,9 +65,6 @@ Tous les secrets sont dans **HashiCorp Vault** (jamais dans Git):
 - `secret/eldocam/turnstile` → `secret`
 
 ### Injection automatique
-Le job Nomad utilise **Workload Identity** (JWT authentication) pour récupérer les secrets de Vault automatiquement au runtime.
-
-### Mise à jour des secrets
 ```bash
 # Utiliser le script fourni
 cd scripts

@@ -3,6 +3,12 @@ variable "image_tag" {
   default = "latest"
 }
 
+variable "vault_token" {
+  type      = string
+  default   = ""
+  sensitive = true
+}
+
 job "eldocam-backend" {
   region      = "global"
   datacenters = ["dc1"]
@@ -54,50 +60,14 @@ job "eldocam-backend" {
     task "server" {
       driver = "docker"
 
-      # Vault integration avec Workload Identity (Nomad 1.11+)
-      vault {
-        policies      = ["eldocam-backend"]
-        change_mode   = "restart"
-        change_signal = "SIGTERM"
-      }
-
-      # Workload Identity for Vault
-      identity {
-        name = "vault_default"
-        aud  = ["vault.io"]
-        ttl  = "1h"
-        env  = false
-        file = false
-      }
-
       config {
         image = "ghcr.io/sebbemercier/eldocam-backend:${var.image_tag}"
         ports = ["http"]
       }
 
-      # Template pour injecter les secrets depuis Vault
-      template {
-        data = <<EOH
-# Secrets Mailjet
-{{ with secret "secret/data/eldocam/mailjet" }}
-MAILJET_API_KEY="{{ .Data.data.api_key }}"
-MAILJET_SECRET_KEY="{{ .Data.data.secret_key }}"
-{{ end }}
-
-# Configuration Email
-{{ with secret "secret/data/eldocam/email" }}
-SENDER_EMAIL="{{ .Data.data.sender_email }}"
-SENDER_NAME="{{ .Data.data.sender_name }}"
-ADMIN_TO="{{ .Data.data.admin_to }}"
-{{ end }}
-
-# Cloudflare Turnstile
-{{ with secret "secret/data/eldocam/turnstile" }}
-TURNSTILE_SECRET="{{ .Data.data.secret }}"
-{{ end }}
-EOH
-        destination = "secrets/app.env"
-        env         = true
+      env {
+        VAULT_ADDR  = "http://master-nomad.groupmercier.tmg:8200"
+        VAULT_TOKEN = var.vault_token
       }
 
       resources {
