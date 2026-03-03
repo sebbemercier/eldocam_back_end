@@ -7,7 +7,7 @@ API backend en Go pour gérer les formulaires de contact Eldocam avec validation
 - **Runtime**: Go 1.25.1+
 - **Orchestration**: HashiCorp Nomad 1.11.2 (cluster 3 servers + 2 clients)
 - **Secrets**: HashiCorp Vault (KV v2 + Workload Identity JWT)
-- **Reverse Proxy**: Traefik v3.1 avec TLS automatique (Cloudflare DNS challenge)
+- **Reverse Proxy**: Traefik avec TLS automatique (Cloudflare DNS challenge)
 - **CI/CD**: CircleCI Cloud
 - **Container Registry**: GitHub Container Registry (ghcr.io)
 - **Email**: Mailjet SMTP
