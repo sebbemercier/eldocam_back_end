@@ -13,6 +13,7 @@ import (
     "sync"
     "time"
 
+    vault "github.com/hashicorp/vault/api"
     "github.com/joho/godotenv"
     "github.com/mailjet/mailjet-apiv3-go/v4"
     "github.com/rs/cors"
@@ -446,29 +447,130 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
     })
 }
 
+// Connexion à Vault et récupération des secrets
+func loadSecretsFromVault() error {
+    vaultAddr := os.Getenv("VAULT_ADDR")
+    if vaultAddr == "" {
+        vaultAddr = "http://master-nomad.groupmercier.tmg:8200"
+    }
+
+    vaultConfig := vault.DefaultConfig()
+    vaultConfig.Address = vaultAddr
+
+    client, err := vault.NewClient(vaultConfig)
+    if err != nil {
+        return fmt.Errorf("erreur création client Vault: %w", err)
+    }
+
+    // Authentification avec JWT (Workload Identity) ou Token
+    jwtPath := os.Getenv("NOMAD_TOKEN_PATH")
+    if jwtPath == "" {
+        jwtPath = "/secrets/nomad_token"
+    }
+
+    // Essayer d'abord avec le JWT Workload Identity
+    if jwtData, err := os.ReadFile(jwtPath); err == nil {
+        log.Println("🔐 Authentification Vault via JWT Workload Identity...")
+        loginData := map[string]interface{}{
+            "role": "eldocam-backend",
+            "jwt":  string(jwtData),
+        }
+        secret, err := client.Logical().Write("auth/jwt-nomad/login", loginData)
+        if err != nil {
+            log.Printf("⚠️ JWT auth échouée: %v, fallback sur VAULT_TOKEN", err)
+        } else if secret != nil && secret.Auth != nil {
+            client.SetToken(secret.Auth.ClientToken)
+            log.Println("✅ Authentifié à Vault via JWT")
+        }
+    }
+
+    // Fallback sur VAULT_TOKEN si défini
+    if client.Token() == "" {
+        vaultToken := os.Getenv("VAULT_TOKEN")
+        if vaultToken != "" {
+            client.SetToken(vaultToken)
+            log.Println("✅ Authentifié à Vault via VAULT_TOKEN")
+        } else {
+            return fmt.Errorf("❌ Aucune méthode d'authentification Vault disponible")
+        }
+    }
+
+    // Récupérer les secrets Mailjet
+    log.Println("📥 Récupération des secrets Mailjet depuis Vault...")
+    mailjetSecret, err := client.Logical().Read("secret/data/eldocam/mailjet")
+    if err != nil {
+        return fmt.Errorf("erreur lecture secret/data/eldocam/mailjet: %w", err)
+    }
+    if mailjetSecret == nil || mailjetSecret.Data == nil {
+        return fmt.Errorf("secret/data/eldocam/mailjet introuvable")
+    }
+
+    data := mailjetSecret.Data["data"].(map[string]interface{})
+    config.MailjetAPIKey = data["api_key"].(string)
+    config.MailjetSecretKey = data["secret_key"].(string)
+
+    // Récupérer les secrets Email
+    log.Println("📥 Récupération des secrets Email depuis Vault...")
+    emailSecret, err := client.Logical().Read("secret/data/eldocam/email")
+    if err != nil {
+        return fmt.Errorf("erreur lecture secret/data/eldocam/email: %w", err)
+    }
+    if emailSecret == nil || emailSecret.Data == nil {
+        return fmt.Errorf("secret/data/eldocam/email introuvable")
+    }
+
+    emailData := emailSecret.Data["data"].(map[string]interface{})
+    config.SenderEmail = emailData["sender_email"].(string)
+    config.SenderName = emailData["sender_name"].(string)
+    config.AdminTo = emailData["admin_to"].(string)
+
+    // Récupérer le secret Turnstile
+    log.Println("📥 Récupération du secret Turnstile depuis Vault...")
+    turnstileSecret, err := client.Logical().Read("secret/data/eldocam/turnstile")
+    if err != nil {
+        return fmt.Errorf("erreur lecture secret/data/eldocam/turnstile: %w", err)
+    }
+    if turnstileSecret == nil || turnstileSecret.Data == nil {
+        return fmt.Errorf("secret/data/eldocam/turnstile introuvable")
+    }
+
+    turnstileData := turnstileSecret.Data["data"].(map[string]interface{})
+    config.TurnstileSecret = turnstileData["secret"].(string)
+
+    log.Println("✅ Tous les secrets récupérés depuis Vault")
+    return nil
+}
+
 // Chargement de la configuration
 func loadConfig() error {
-    // Charger .env si présent
+    // Charger .env si présent (pour dev local)
     godotenv.Load()
 
-    config = Config{
-        MailjetAPIKey:    os.Getenv("MAILJET_API_KEY"),
-        MailjetSecretKey: os.Getenv("MAILJET_SECRET_KEY"),
-        SenderEmail:      os.Getenv("SENDER_EMAIL"),
-        SenderName:       os.Getenv("SENDER_NAME"),
-        AdminTo:          os.Getenv("ADMIN_TO"),
-        TurnstileSecret:  os.Getenv("TURNSTILE_SECRET"),
-    }
+    // Essayer de charger depuis Vault en priorité
+    if err := loadSecretsFromVault(); err != nil {
+        log.Printf("⚠️ Impossible de charger depuis Vault: %v", err)
+        log.Println("📋 Fallback sur variables d'environnement...")
 
-    // Valeurs par défaut
-    if config.SenderEmail == "" {
-        config.SenderEmail = "noreply@eldocam.com"
-    }
-    if config.SenderName == "" {
-        config.SenderName = "Eldocam Contact"
-    }
-    if config.AdminTo == "" {
-        config.AdminTo = "smercier2000@gmail.com"
+        // Fallback sur variables d'environnement
+        config = Config{
+            MailjetAPIKey:    os.Getenv("MAILJET_API_KEY"),
+            MailjetSecretKey: os.Getenv("MAILJET_SECRET_KEY"),
+            SenderEmail:      os.Getenv("SENDER_EMAIL"),
+            SenderName:       os.Getenv("SENDER_NAME"),
+            AdminTo:          os.Getenv("ADMIN_TO"),
+            TurnstileSecret:  os.Getenv("TURNSTILE_SECRET"),
+        }
+
+        // Valeurs par défaut
+        if config.SenderEmail == "" {
+            config.SenderEmail = "noreply@eldocam.com"
+        }
+        if config.SenderName == "" {
+            config.SenderName = "Eldocam Contact"
+        }
+        if config.AdminTo == "" {
+            config.AdminTo = "smercier2000@gmail.com"
+        }
     }
 
     // Vérifications
