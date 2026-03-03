@@ -446,35 +446,51 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
     })
 }
 
-// vaultGet lit un secret KV v2 depuis Vault via l'API HTTP
+// vaultGet lit un secret KV v2 depuis Vault via l'API HTTP avec retry (gestion nœuds standby)
 func vaultGet(vaultAddr, token, path string) (map[string]interface{}, error) {
     url := fmt.Sprintf("%s/v1/%s", vaultAddr, path)
-    req, err := http.NewRequest("GET", url, nil)
-    if err != nil {
-        return nil, err
-    }
-    req.Header.Set("X-Vault-Token", token)
 
-    resp, err := http.DefaultClient.Do(req)
-    if err != nil {
-        return nil, fmt.Errorf("erreur requête Vault (%s): %w", url, err)
-    }
-    defer resp.Body.Close()
+    var lastErr error
+    for attempt := 1; attempt <= 5; attempt++ {
+        req, err := http.NewRequest("GET", url, nil)
+        if err != nil {
+            return nil, err
+        }
+        req.Header.Set("X-Vault-Token", token)
 
-    if resp.StatusCode != http.StatusOK {
+        resp, err := http.DefaultClient.Do(req)
+        if err != nil {
+            lastErr = fmt.Errorf("erreur requête Vault (%s): %w", url, err)
+            time.Sleep(time.Duration(attempt) * 2 * time.Second)
+            continue
+        }
+
         body, _ := io.ReadAll(resp.Body)
-        return nil, fmt.Errorf("Vault HTTP %d pour %s: %s", resp.StatusCode, path, string(body))
-    }
+        resp.Body.Close()
 
-    var result struct {
-        Data struct {
-            Data map[string]interface{} `json:"data"`
-        } `json:"data"`
+        if resp.StatusCode == 503 {
+            // Nœud standby, on attend et on réessaie
+            log.Printf("⏳ Vault nœud standby (tentative %d/5), retry dans %ds...", attempt, attempt*2)
+            lastErr = fmt.Errorf("Vault HTTP 503 (standby): %s", string(body))
+            time.Sleep(time.Duration(attempt) * 2 * time.Second)
+            continue
+        }
+
+        if resp.StatusCode != http.StatusOK {
+            return nil, fmt.Errorf("Vault HTTP %d pour %s: %s", resp.StatusCode, path, string(body))
+        }
+
+        var result struct {
+            Data struct {
+                Data map[string]interface{} `json:"data"`
+            } `json:"data"`
+        }
+        if err := json.Unmarshal(body, &result); err != nil {
+            return nil, fmt.Errorf("erreur décodage réponse Vault: %w", err)
+        }
+        return result.Data.Data, nil
     }
-    if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-        return nil, fmt.Errorf("erreur décodage réponse Vault: %w", err)
-    }
-    return result.Data.Data, nil
+    return nil, fmt.Errorf("Vault inaccessible après 5 tentatives: %w", lastErr)
 }
 
 // vaultLogin s'authentifie via JWT (Workload Identity) et retourne un token Vault
