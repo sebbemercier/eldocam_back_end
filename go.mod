@@ -3,7 +3,6 @@ module back_eldocam
 go 1.23
 
 require (
-	github.com/hashicorp/vault/api v1.10.0
 	github.com/joho/godotenv v1.5.1
 	github.com/mailjet/mailjet-apiv3-go/v4 v4.0.8
 	github.com/rs/cors v1.11.1

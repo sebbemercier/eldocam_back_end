@@ -13,7 +13,6 @@ import (
     "sync"
     "time"
 
-    vault "github.com/hashicorp/vault/api"
     "github.com/joho/godotenv"
     "github.com/mailjet/mailjet-apiv3-go/v4"
     "github.com/rs/cors"
@@ -447,6 +446,64 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
     })
 }
 
+// vaultGet lit un secret KV v2 depuis Vault via l'API HTTP
+func vaultGet(vaultAddr, token, path string) (map[string]interface{}, error) {
+    url := fmt.Sprintf("%s/v1/%s", vaultAddr, path)
+    req, err := http.NewRequest("GET", url, nil)
+    if err != nil {
+        return nil, err
+    }
+    req.Header.Set("X-Vault-Token", token)
+
+    resp, err := http.DefaultClient.Do(req)
+    if err != nil {
+        return nil, fmt.Errorf("erreur requête Vault (%s): %w", url, err)
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode != http.StatusOK {
+        body, _ := io.ReadAll(resp.Body)
+        return nil, fmt.Errorf("Vault HTTP %d pour %s: %s", resp.StatusCode, path, string(body))
+    }
+
+    var result struct {
+        Data struct {
+            Data map[string]interface{} `json:"data"`
+        } `json:"data"`
+    }
+    if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+        return nil, fmt.Errorf("erreur décodage réponse Vault: %w", err)
+    }
+    return result.Data.Data, nil
+}
+
+// vaultLogin s'authentifie via JWT (Workload Identity) et retourne un token Vault
+func vaultLogin(vaultAddr, jwtToken string) (string, error) {
+    url := fmt.Sprintf("%s/v1/auth/jwt-nomad/login", vaultAddr)
+    payload := fmt.Sprintf(`{"role":"eldocam-backend","jwt":%q}`, jwtToken)
+
+    resp, err := http.Post(url, "application/json", strings.NewReader(payload))
+    if err != nil {
+        return "", fmt.Errorf("erreur login JWT Vault: %w", err)
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode != http.StatusOK {
+        body, _ := io.ReadAll(resp.Body)
+        return "", fmt.Errorf("Vault JWT login HTTP %d: %s", resp.StatusCode, string(body))
+    }
+
+    var result struct {
+        Auth struct {
+            ClientToken string `json:"client_token"`
+        } `json:"auth"`
+    }
+    if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+        return "", fmt.Errorf("erreur décodage token Vault: %w", err)
+    }
+    return result.Auth.ClientToken, nil
+}
+
 // Connexion à Vault et récupération des secrets
 func loadSecretsFromVault() error {
     vaultAddr := os.Getenv("VAULT_ADDR")
@@ -454,88 +511,55 @@ func loadSecretsFromVault() error {
         vaultAddr = "http://master-nomad.groupmercier.tmg:8200"
     }
 
-    vaultConfig := vault.DefaultConfig()
-    vaultConfig.Address = vaultAddr
-
-    client, err := vault.NewClient(vaultConfig)
-    if err != nil {
-        return fmt.Errorf("erreur création client Vault: %w", err)
-    }
-
-    // Authentification avec JWT (Workload Identity) ou Token
-    jwtPath := os.Getenv("NOMAD_TOKEN_PATH")
-    if jwtPath == "" {
-        jwtPath = "/secrets/nomad_token"
-    }
+    var token string
 
     // Essayer d'abord avec le JWT Workload Identity
+    jwtPath := "/secrets/nomad_token"
     if jwtData, err := os.ReadFile(jwtPath); err == nil {
         log.Println("🔐 Authentification Vault via JWT Workload Identity...")
-        loginData := map[string]interface{}{
-            "role": "eldocam-backend",
-            "jwt":  string(jwtData),
-        }
-        secret, err := client.Logical().Write("auth/jwt-nomad/login", loginData)
+        token, err = vaultLogin(vaultAddr, strings.TrimSpace(string(jwtData)))
         if err != nil {
             log.Printf("⚠️ JWT auth échouée: %v, fallback sur VAULT_TOKEN", err)
-        } else if secret != nil && secret.Auth != nil {
-            client.SetToken(secret.Auth.ClientToken)
+        } else {
             log.Println("✅ Authentifié à Vault via JWT")
         }
     }
 
-    // Fallback sur VAULT_TOKEN si défini
-    if client.Token() == "" {
-        vaultToken := os.Getenv("VAULT_TOKEN")
-        if vaultToken != "" {
-            client.SetToken(vaultToken)
-            log.Println("✅ Authentifié à Vault via VAULT_TOKEN")
-        } else {
+    // Fallback sur VAULT_TOKEN
+    if token == "" {
+        token = os.Getenv("VAULT_TOKEN")
+        if token == "" {
             return fmt.Errorf("❌ Aucune méthode d'authentification Vault disponible")
         }
+        log.Println("✅ Authentifié à Vault via VAULT_TOKEN")
     }
 
     // Récupérer les secrets Mailjet
     log.Println("📥 Récupération des secrets Mailjet depuis Vault...")
-    mailjetSecret, err := client.Logical().Read("secret/data/eldocam/mailjet")
+    mailjet, err := vaultGet(vaultAddr, token, "secret/data/eldocam/mailjet")
     if err != nil {
-        return fmt.Errorf("erreur lecture secret/data/eldocam/mailjet: %w", err)
+        return err
     }
-    if mailjetSecret == nil || mailjetSecret.Data == nil {
-        return fmt.Errorf("secret/data/eldocam/mailjet introuvable")
-    }
-
-    data := mailjetSecret.Data["data"].(map[string]interface{})
-    config.MailjetAPIKey = data["api_key"].(string)
-    config.MailjetSecretKey = data["secret_key"].(string)
+    config.MailjetAPIKey = mailjet["api_key"].(string)
+    config.MailjetSecretKey = mailjet["secret_key"].(string)
 
     // Récupérer les secrets Email
     log.Println("📥 Récupération des secrets Email depuis Vault...")
-    emailSecret, err := client.Logical().Read("secret/data/eldocam/email")
+    email, err := vaultGet(vaultAddr, token, "secret/data/eldocam/email")
     if err != nil {
-        return fmt.Errorf("erreur lecture secret/data/eldocam/email: %w", err)
+        return err
     }
-    if emailSecret == nil || emailSecret.Data == nil {
-        return fmt.Errorf("secret/data/eldocam/email introuvable")
-    }
-
-    emailData := emailSecret.Data["data"].(map[string]interface{})
-    config.SenderEmail = emailData["sender_email"].(string)
-    config.SenderName = emailData["sender_name"].(string)
-    config.AdminTo = emailData["admin_to"].(string)
+    config.SenderEmail = email["sender_email"].(string)
+    config.SenderName = email["sender_name"].(string)
+    config.AdminTo = email["admin_to"].(string)
 
     // Récupérer le secret Turnstile
     log.Println("📥 Récupération du secret Turnstile depuis Vault...")
-    turnstileSecret, err := client.Logical().Read("secret/data/eldocam/turnstile")
+    turnstile, err := vaultGet(vaultAddr, token, "secret/data/eldocam/turnstile")
     if err != nil {
-        return fmt.Errorf("erreur lecture secret/data/eldocam/turnstile: %w", err)
+        return err
     }
-    if turnstileSecret == nil || turnstileSecret.Data == nil {
-        return fmt.Errorf("secret/data/eldocam/turnstile introuvable")
-    }
-
-    turnstileData := turnstileSecret.Data["data"].(map[string]interface{})
-    config.TurnstileSecret = turnstileData["secret"].(string)
+    config.TurnstileSecret = turnstile["secret"].(string)
 
     log.Println("✅ Tous les secrets récupérés depuis Vault")
     return nil
