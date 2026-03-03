@@ -4,9 +4,8 @@ variable "image_tag" {
 }
 
 variable "vault_token" {
-  type      = string
-  default   = ""
-  sensitive = true
+  type    = string
+  default = ""
 }
 
 job "eldocam-backend" {
