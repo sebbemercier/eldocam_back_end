@@ -446,6 +446,23 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
     })
 }
 
+// vaultActiveAddr retourne l'adresse du nœud Vault actif via sys/leader
+func vaultActiveAddr(vaultAddr string) string {
+    resp, err := http.Get(fmt.Sprintf("%s/v1/sys/leader", vaultAddr))
+    if err != nil {
+        return vaultAddr
+    }
+    defer resp.Body.Close()
+    var result struct {
+        LeaderAddress string `json:"leader_address"`
+    }
+    if err := json.NewDecoder(resp.Body).Decode(&result); err != nil || result.LeaderAddress == "" {
+        return vaultAddr
+    }
+    log.Printf("🔍 Nœud Vault actif: %s", result.LeaderAddress)
+    return strings.TrimRight(result.LeaderAddress, "/")
+}
+
 // vaultGet lit un secret KV v2 depuis Vault via l'API HTTP avec retry (gestion nœuds standby)
 func vaultGet(vaultAddr, token, path string) (map[string]interface{}, error) {
     url := fmt.Sprintf("%s/v1/%s", vaultAddr, path)
@@ -526,6 +543,9 @@ func loadSecretsFromVault() error {
     if vaultAddr == "" {
         vaultAddr = "http://master-nomad.groupmercier.tmg:8200"
     }
+
+    // Se connecter directement au nœud actif pour éviter les standby/sealed
+    vaultAddr = vaultActiveAddr(vaultAddr)
 
     var token string
 
