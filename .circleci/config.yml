@@ -3,8 +3,10 @@ version: 2.1
 # Configuration pour CircleCI Cloud
 # Nécessite les contextes :
 # - github-creds : DOCKER_LOGIN, DOCKER_PASSWORD
-# - nomad-creds : NOMAD_ADDR, NOMAD_TOKEN
-# - vault-creds : VAULT_TOKEN (pour mise à jour secrets)
+# - nomad-creds  : NOMAD_ADDR, NOMAD_TOKEN
+# 
+# Les secrets applicatifs sont lus DIRECTEMENT depuis Vault par le container
+# via JWT Workload Identity (injecté par Nomad). Aucun VAULT_TOKEN nécessaire ici.
 
 jobs:
   # Job optionnel pour mettre à jour les secrets Vault
@@ -55,8 +57,8 @@ jobs:
           name: Deploy to Nomad
           command: |
             export IMAGE_TAG="<< pipeline.number >>-${CIRCLE_SHA1:0:7}"
-            nomad job validate -var image_tag=${IMAGE_TAG} -var vault_token=${VAULT_TOKEN} nomad/eldocam-backend.nomad.hcl
-            nomad job run -var image_tag=${IMAGE_TAG} -var vault_token=${VAULT_TOKEN} nomad/eldocam-backend.nomad.hcl
+            nomad job validate -var="image_tag=${IMAGE_TAG}" nomad/eldocam-backend.nomad.hcl
+            nomad job run -var="image_tag=${IMAGE_TAG}" nomad/eldocam-backend.nomad.hcl
 
 workflows:
   version: 2
@@ -72,7 +74,6 @@ workflows:
             - build-and-push
           context:
             - nomad-creds
-            - vault-creds
           filters:
             branches:
               only: main

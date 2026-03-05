@@ -549,53 +549,52 @@ func loadSecretsFromVault() error {
 
     var token string
 
-    // Essayer d'abord avec le JWT Workload Identity
-    jwtPath := "/secrets/nomad_token"
-    if jwtData, err := os.ReadFile(jwtPath); err == nil {
-        log.Println("🔐 Authentification Vault via JWT Workload Identity...")
+    // Essayer d'abord avec le JWT Workload Identity (injecté par Nomad)
+    // Le fichier est écrit par le bloc identity { name = "vault_jwt" } dans le job Nomad
+    for _, jwtPath := range []string{"/secrets/vault_jwt", "/secrets/nomad_token"} {
+        jwtData, err := os.ReadFile(jwtPath)
+        if err != nil {
+            continue
+        }
+        log.Printf("🔐 Authentification Vault via JWT Workload Identity (%s)...", jwtPath)
         token, err = vaultLogin(vaultAddr, strings.TrimSpace(string(jwtData)))
         if err != nil {
-            log.Printf("⚠️ JWT auth échouée: %v, fallback sur VAULT_TOKEN", err)
-        } else {
-            log.Println("✅ Authentifié à Vault via JWT")
+            log.Printf("⚠️ JWT auth échouée (%s): %v", jwtPath, err)
+            continue
         }
+        log.Println("✅ Authentifié à Vault via JWT")
+        break
     }
 
-    // Fallback sur VAULT_TOKEN
+    // Fallback sur VAULT_TOKEN (dev local ou urgence)
     if token == "" {
         token = os.Getenv("VAULT_TOKEN")
         if token == "" {
-            return fmt.Errorf("❌ Aucune méthode d'authentification Vault disponible")
+            return fmt.Errorf("❌ Aucune méthode d'authentification Vault disponible (JWT introuvable et VAULT_TOKEN absent)")
         }
         log.Println("✅ Authentifié à Vault via VAULT_TOKEN")
     }
 
-    // Récupérer les secrets Mailjet
-    log.Println("📥 Récupération des secrets Mailjet depuis Vault...")
-    mailjet, err := vaultGet(vaultAddr, token, "secret/data/eldocam/mailjet")
+    // Récupérer tous les secrets depuis le path unique secret/eldocam
+    log.Println("📥 Récupération des secrets depuis Vault (secret/eldocam)...")
+    secrets, err := vaultGet(vaultAddr, token, "secret/data/eldocam")
     if err != nil {
         return err
     }
-    config.MailjetAPIKey = mailjet["api_key"].(string)
-    config.MailjetSecretKey = mailjet["secret_key"].(string)
 
-    // Récupérer les secrets Email
-    log.Println("📥 Récupération des secrets Email depuis Vault...")
-    email, err := vaultGet(vaultAddr, token, "secret/data/eldocam/email")
-    if err != nil {
-        return err
+    getString := func(key string) string {
+        if v, ok := secrets[key].(string); ok {
+            return v
+        }
+        return ""
     }
-    config.SenderEmail = email["sender_email"].(string)
-    config.SenderName = email["sender_name"].(string)
-    config.AdminTo = email["admin_to"].(string)
 
-    // Récupérer le secret Turnstile
-    log.Println("📥 Récupération du secret Turnstile depuis Vault...")
-    turnstile, err := vaultGet(vaultAddr, token, "secret/data/eldocam/turnstile")
-    if err != nil {
-        return err
-    }
-    config.TurnstileSecret = turnstile["secret"].(string)
+    config.MailjetAPIKey = getString("mailjet_api_key")
+    config.MailjetSecretKey = getString("mailjet_secret_key")
+    config.SenderEmail = getString("sender_email")
+    config.SenderName = getString("sender_name")
+    config.AdminTo = getString("admin_to")
+    config.TurnstileSecret = getString("turnstile_secret")
 
     log.Println("✅ Tous les secrets récupérés depuis Vault")
     return nil
