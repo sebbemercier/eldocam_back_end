@@ -60,7 +60,7 @@ job "eldocam-backend" {
       }
 
       # Workload Identity : Nomad injecte un JWT de courte durée dans /secrets/vault_jwt
-      # Ce JWT est utilisé par l'app pour s'authentifier à Vault sans token fixe
+      # Utilisé par l'app Go pour s'authentifier à Vault (auth/jwt-nomad)
       identity {
         name = "vault_jwt"
         aud  = ["vault.io"]
