@@ -3,6 +3,11 @@ variable "image_tag" {
   default = "latest"
 }
 
+variable "vault_token" {
+  type    = string
+  default = ""
+}
+
 job "eldocam-backend" {
   region      = "global"
   datacenters = ["dc1"]
@@ -59,17 +64,9 @@ job "eldocam-backend" {
         ports = ["http"]
       }
 
-      # Workload Identity : Nomad injecte un JWT de courte durée dans /secrets/vault_jwt
-      # Utilisé par l'app Go pour s'authentifier à Vault (auth/jwt-nomad)
-      identity {
-        name = "vault_jwt"
-        aud  = ["vault.io"]
-        file = true
-        ttl  = "1h"
-      }
-
       env {
-        VAULT_ADDR = "http://master-nomad.groupmercier.tmg:8200"
+        VAULT_ADDR  = "http://master-nomad.groupmercier.tmg:8200"
+        VAULT_TOKEN = var.vault_token
       }
 
       resources {
