@@ -22,6 +22,10 @@ job "eldocam-backend" {
   group "api" {
     count = 2
 
+    vault {
+      policies = ["eldocam-backend"]
+    }
+
     update {
       max_parallel     = 1
       min_healthy_time = "10s"
@@ -59,6 +63,22 @@ job "eldocam-backend" {
     task "server" {
       driver = "docker"
 
+      template {
+        destination = "local/eldocam.env"
+        env         = true
+        change_mode = "restart"
+        data = <<-EOH
+{{ with secret "secret/data/eldocam" -}}
+MAILJET_API_KEY={{ .Data.data.mailjet_api_key }}
+MAILJET_SECRET_KEY={{ .Data.data.mailjet_secret_key }}
+SENDER_EMAIL={{ .Data.data.sender_email }}
+SENDER_NAME={{ .Data.data.sender_name }}
+ADMIN_TO={{ .Data.data.admin_to }}
+TURNSTILE_SECRET={{ .Data.data.turnstile_secret }}
+{{- end }}
+EOH
+      }
+
       config {
         image = "ghcr.io/sebbemercier/eldocam-backend:${var.image_tag}"
         ports = ["http"]
@@ -66,7 +86,6 @@ job "eldocam-backend" {
 
       env {
         VAULT_ADDR  = "http://master-nomad.groupmercier.tmg:8200"
-        VAULT_TOKEN = var.vault_token
       }
 
       resources {
